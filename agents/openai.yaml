@@ -1,4 +1,15 @@
 interface:
   display_name: "Multi-Agent Orchestrator"
-  short_description: "Decompose broad work into bounded GPT-5.5 coding workers and GPT-5.4-mini high-reasoning sidecars, then synthesize and verify closure"
-  default_prompt: "Use $multi-agent-orchestrator for complex, broad, recovery, or explicitly parallel work. Start with RUNNING: SUPER FAST PREVIOUS CONTEXT SPARK, define the finish line, prove source truth, then decompose only independent workstreams. Route coding workers to gpt-5.5 with medium reasoning, and route research/review/verification sidecars to gpt-5.4-mini with high reasoning. Tell every agent to use connector-native tools first, $computer-use:computer-use for native app UI, @Browser for local/in-app browser work, and @Chrome for authenticated Chrome/profile-dependent browser work when relevant. Keep the controller on the critical path, assign disjoint file ownership, tell agents they are not alone in the codebase and must not revert others, synthesize results against primary evidence, run critique plus similar-instance sweep, and close only with fresh proof."
+  short_description: "Coordinate bounded independent work and verify the complete outcome."
+  default_prompt: >-
+    Use $multi-agent-orchestrator for complex, broad, recovery or explicitly
+    parallel work. Bind the current request and proof layer, reuse verified
+    prior-route and current-source evidence, and delegate only necessary
+    independent lanes. Use current configured models and preserve fixed role
+    assignments or explicit user choices. Prefer connectors; follow the active
+    global browser and authentication routes, including their supported fallback.
+    Keep one shared controller, assign disjoint ownership, preserve others' work,
+    and retain successful state. Correct the exact failing layer without fixed
+    retry quotas. Obtain applicable reviews without duplicate ceremony and verify
+    every authorised outcome. Adapt communication to the user; examples never
+    require a fixed opening phrase, section count or closing template.
