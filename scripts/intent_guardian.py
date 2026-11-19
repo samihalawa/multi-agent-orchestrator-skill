@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -47,6 +47,10 @@ failed route, missing known context, implementation replaced by a report, lost
 work, or unsupported completion. These are examples, not a fixed classifier.
 Normal progress is not a defect because later work is still pending. Unknown
 proof is not proof of failure. A stated future plan is not a completed action.
+Check the exact scope clause and any exceptions before alleging an unauthorized
+action. A clipped delegation can omit the governing exception. Missing portions
+cannot establish a rule or a contradiction, and an observer cannot invent a
+worker's role restrictions when its instructions are absent.
 A correction must CHANGE the executor's currently selected next action. If its
 latest compatible plan already performs the proposed action, stay quiet at an
 active checkpoint. Repeating that plan or requesting its future proof early adds
@@ -262,7 +266,10 @@ def add_evidence(state, kind, text, source_id):
         return
     # Human corrections are never silently clipped or evicted before a review.
     # A bounded packet can name a scope gap instead of making an unsafe judgment.
-    entry = {"id": source_id, "kind": kind, "text": text if kind in {"user", "task_request"} else bounded(text, 2000)}
+    # Agent briefs often put scope exceptions between the opening and closing
+    # lines. Preserve more of the exact dispatch within the same packet budget.
+    limit = 6000 if kind == "action" and text.startswith(("Agent ", "Task ", "spawn_agent ")) else 2000
+    entry = {"id": source_id, "kind": kind, "text": text if kind in {"user", "task_request"} else bounded(text, limit)}
     state["evidence"].append(entry)
     state["evidence"] = state["evidence"][-36:]
     while len(state["evidence"]) > 2 and sum(len(e["text"]) for e in state["evidence"]) > 24000:

@@ -210,6 +210,13 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(state["intent"], [])
         self.assertTrue(g.real_prompt("The Intent observer: report needs reviewing"))
 
+    def test_delegation_middle_scope_exception_survives_checkpoint_packet(self):
+        state = g.initial_state("contract-test", "claude")
+        exception = "Regenerable caches may be removed directly."
+        prompt = "Agent " + ("scope " * 250) + exception + (" evidence" * 150)
+        g.add_evidence(state, "action", prompt, "delegation")
+        self.assertEqual(state["evidence"][-1]["text"], prompt)
+
     def test_native_wrapped_feedback_cannot_resume_an_interrupted_task(self):
         feedback = "Intent observer: Verify the native result."
         wrapper = '<hook_prompt hook_run_id="stop:11:/hooks.json">' + feedback + '</hook_prompt>'
