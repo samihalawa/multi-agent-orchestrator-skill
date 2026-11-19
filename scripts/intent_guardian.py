@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -66,6 +66,10 @@ You cannot act on providers. Point the executor to ONE exact feasible next actio
 and the actual evidence needed; do not issue generic exhortations or ask the user.
 If a prior correction exists, mark it resolved only with NEW cited evidence that
 shows the correction happened, not a promise or another assistant's done claim.
+On the same human request, keep an unresolved correction pending without
+reissuing it. Polling or seeing the same unfinished condition with a new
+timestamp is not a new defect. A later owner direction or native proof that
+the original route is no longer needed can supersede the instruction.
 Return JSON only with keys:
 {"intervene":boolean,"reason":string,"next_action":string,"proof_needed":string,
  "evidence_ids":[string],"resolved":boolean,"resolution_evidence_ids":[string],
@@ -712,6 +716,8 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     state["scope_gap"] = {"cause": "Earlier engine evicted unreviewed human corrections; original transcript is absent", "source": None}
         state["last_event"], state["last_seen"] = name, time.time()
         revision_before_event = state.get("human_revision", 0)
+        if state.get("pending"):
+            state["pending"].setdefault("human_revision", revision_before_event)
         ingest(state, event, host)
         intent_chars = sum(len(entry["text"]) for entry in state["intent"])
         if intent_chars > int(cfg.get("max_unsummarized_intent_chars", 120000)):
@@ -792,16 +798,20 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     state["last_resolution"] = {"at": time.time(), "evidence_ids": decision.get("resolution_evidence_ids"), "correction": state.get("pending")}
                     state["pending"] = None
                 if decision.get("intervene"):
-                    substantive_boundary = digest({"intent": state["intent"], "records": [e for e in state["evidence"] if e["kind"] in {"action", "tool"}]})
                     correction_hash = digest({k: decision.get(k) for k in ["reason", "next_action", "proof_needed", "evidence_ids"]})
-                    prior_boundary = (state.get("pending") or {}).get("substantive_boundary")
-                    if correction_hash != state.get("last_correction_hash") and substantive_boundary != prior_boundary:
+                    pending = state.get("pending")
+                    current_revision = state.get("human_revision", 0)
+                    pending_revision = (pending or {}).get("human_revision", current_revision)
+                    can_emit = not pending or pending_revision != current_revision
+                    if can_emit and correction_hash != state.get("last_correction_hash"):
                         output = emit_correction(name, decision, host)
                         feedback = output.get("reason") or output.get("hookSpecificOutput", {}).get("additionalContext", "")
                         state["emitted_feedback_hashes"] = (state.get("emitted_feedback_hashes", []) + [digest(feedback.strip())])[-16:]
                         state["last_correction_hash"] = correction_hash
-                        state["pending"] = {"verdict_domain": decision["verdict_domain"], "reason": bounded(decision["reason"], 650), "next_action": bounded(decision["next_action"], 900), "proof_needed": bounded(decision["proof_needed"], 650), "evidence_ids": decision["evidence_ids"], "review_evidence_ids": [e["id"] for e in payload["evidence"]], "substantive_boundary": substantive_boundary, "at": time.time()}
+                        state["pending"] = {"verdict_domain": decision["verdict_domain"], "reason": bounded(decision["reason"], 650), "next_action": bounded(decision["next_action"], 900), "proof_needed": bounded(decision["proof_needed"], 650), "evidence_ids": decision["evidence_ids"], "review_evidence_ids": [e["id"] for e in payload["evidence"]], "human_revision": current_revision, "at": time.time()}
                         state["interventions"] = state.get("interventions", 0) + 1
+                    elif pending and not can_emit:
+                        state["last_review"]["suppressed_pending_intervention"] = True
                 state["completed"] = bool(decision.get("completed")) and not state.get("pending")
                 why = "reviewed"
             except Exception as exc:

@@ -215,6 +215,26 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(state["interventions"], 1)
         self.assertIsNotNone(state["pending"])
 
+    def test_new_status_poll_does_not_repeat_pending_correction(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Finish the background run, then verify in the browser."))
+        calls = []
+
+        def evaluator(cfg, payload):
+            calls.append(payload)
+            return {"intervene": True, "reason": f"The background run is still pending, status {len(calls)}.",
+                    "next_action": "Continue the existing run.", "proof_needed": "Native browser verification.",
+                    "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {}}
+
+        first, state = self.run_event(self.event("Stop"), evaluator)
+        self.assertIn("decision", first)
+        original = state["pending"]
+        self.run_event(self.event("PostToolUse", tool_name="check_status", tool_response="Existing run still at 12/20."))
+        second, state = self.run_event(self.event("Stop", stop_hook_active=True, last_assistant_message="It is still running."), evaluator)
+        self.assertEqual(second, {})
+        self.assertEqual(state["interventions"], 1)
+        self.assertEqual(state["pending"], original)
+        self.assertTrue(state["last_review"]["suppressed_pending_intervention"])
+
     def test_pretool_checkpoint_is_advisory_and_never_denies_the_tool(self):
         self.cfg["checkpoint_every"] = 1
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
@@ -308,7 +328,7 @@ class GuardianContracts(unittest.TestCase):
         file = self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json")
         g.atomic_save(file, state)
         _, upgraded = self.run_event(self.event("SessionStart"))
-        self.assertEqual(upgraded["version"], "1.2.0")
+        self.assertEqual(upgraded["version"], g.VERSION)
         self.assertEqual(upgraded["intent"], state["intent"])
         self.assertEqual(upgraded["policy_migrated_from"], "1.1.0")
         self.assertNotIn("reviewed_hash", upgraded)
