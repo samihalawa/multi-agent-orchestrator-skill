@@ -97,11 +97,47 @@ class GuardianContracts(unittest.TestCase):
 
     def test_subagent_never_spawns_recursive_model_review(self):
         transcript = self.root / "child.jsonl"
-        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"thread_source": "subagent"}}) + "\n")
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "contract-test", "thread_source": "subagent"}}) + "\n")
         self.run_event(self.event("SessionStart", transcript_path=str(transcript)))
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
         self.run_event(self.event("Stop"))
         self.assertEqual(self.calls, [])
+
+    def test_first_transcript_keeps_captured_claude_request_once(self):
+        transcript = self.root / "claude.jsonl"
+        prompt = "Finish the background run and verify the published result."
+        g.process_event(self.event("UserPromptSubmit", prompt=prompt), "claude", self.cfg, self.root / "state", self.reviewer)
+        transcript.write_text(json.dumps({"type": "user", "uuid": "real-user-message",
+                                         "message": {"content": prompt}}) + "\n")
+        _, state = g.process_event(self.event("Stop", transcript_path=str(transcript)),
+                                   "claude", self.cfg, self.root / "state", self.reviewer)
+        self.assertEqual([e["text"] for e in state["intent"]], [prompt])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_repeated_goal_envelope_is_a_single_task_request(self):
+        envelope = '<codex_internal_context source="goal">\n<objective>Verify the real outcome.</objective>\n' + ("runtime instructions\n" * 2000) + "</codex_internal_context>"
+        state = g.initial_state("contract-test", "codex")
+        g.add_evidence(state, "user", envelope, "goal1")
+        g.add_evidence(state, "user", envelope, "goal2")
+        self.assertEqual([(e["kind"], e["text"]) for e in state["intent"]],
+                         [("task_request", "Verify the real outcome.")])
+        self.assertFalse(state.get("human_revision", 0))
+
+    def test_122_migration_rebinds_existing_native_desktop_task(self):
+        transcript = self.root / "desktop.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "contract-test", "thread_source": "agent_created_thread"}},
+            {"type": "session_meta", "payload": {"id": "other-thread", "thread_source": "subagent"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Complete the actual work."}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        state = g.initial_state("contract-test", "codex")
+        state.update(version="1.2.1", subagent=True, transcript_path=str(transcript), offset=transcript.stat().st_size)
+        statefile = self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json")
+        g.atomic_save(statefile, state)
+        _, upgraded = self.run_event(self.event("Stop"))
+        self.assertFalse(upgraded["subagent"])
+        self.assertEqual(len(self.calls), 1)
 
     def test_resolution_requires_evidence_after_the_correction(self):
         payload = {"intent": [], "evidence": [{"id": "e:old", "kind": "tool"}],

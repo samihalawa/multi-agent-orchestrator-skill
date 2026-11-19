@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -128,6 +128,19 @@ def real_prompt(text):
     return bool(text) and not text.startswith(NOISE_PREFIXES)
 
 
+def classify_prompt(text):
+    """Separate runtime task envelopes from actual owner steering."""
+    text = text.strip()
+    if text.startswith('<codex_internal_context source="goal">'):
+        match = re.search(r"<objective>([\s\S]*?)</objective>", text)
+        return ("task_request", match.group(1).strip()) if match else ("tool", text)
+    if text.startswith("<scheduled-task ") and "</scheduled-task>" in text:
+        return "task_request", text
+    if text.startswith("<skill>") and text.endswith("</skill>"):
+        return "tool", text
+    return "user", text
+
+
 def runtime_task_request(payload):
     # Native create_thread transports the new task's original request in a
     # function result, rather than a UserMessage. Preserve its task provenance;
@@ -221,6 +234,11 @@ def add_evidence(state, kind, text, source_id):
         return
     if kind == "user" and digest(text) in state.get("emitted_feedback_hashes", []):
         return
+    if kind == "user":
+        kind, text = classify_prompt(text)
+    if kind == "task_request":
+        if any(e["kind"] in {"user", "task_request"} and e["text"] == text for e in state["intent"]):
+            return
     source_id = "e:" + str(source_id)
     if any(e["id"] == source_id and e["kind"] == kind for e in state["evidence"] + state["intent"]):
         return
@@ -269,8 +287,10 @@ def ingest(state, event, host):
             stat = path.stat()
             identity = [stat.st_dev, stat.st_ino]
             if state.get("file_identity") != identity or stat.st_size < state["offset"]:
+                pending_hash = (state.get("pending_hook_prompt") or {}).get("hash")
+                captured = [e for e in state["intent"] if digest(e["text"]) == pending_hash]
                 state["offset"], state["line"] = 0, 0
-                state["evidence"], state["intent"] = [], []
+                state["evidence"], state["intent"] = list(captured), list(captured)
                 state["file_identity"] = identity
             with path.open("rb") as stream:
                 stream.seek(state["offset"])
@@ -291,14 +311,17 @@ def ingest(state, event, host):
                     if row.get("type") == "session_meta":
                         meta = row.get("payload", {})
                         source = meta.get("source", {})
-                        if meta.get("thread_source") == "subagent" or isinstance(source, dict) and source.get("subagent"):
-                            state["subagent"] = True
+                        if meta.get("id") == state["session_id"]:
+                            state["subagent"] = bool(meta.get("thread_source") == "subagent"
+                                                     or isinstance(source, dict) and source.get("subagent"))
                     for kind, text, sid in records(row, host, state["line"]):
                         hook_prompt = state.get("pending_hook_prompt", {})
-                        if kind == "user" and digest(redact(text).strip()) == hook_prompt.get("hash"):
+                        signature_hash = digest(redact(text).strip())
+                        if kind == "user" and signature_hash == hook_prompt.get("hash"):
                             state.pop("pending_hook_prompt", None)
-                            state["last_transport_record"] = {"signature": digest([kind, redact(text).strip()]), "transport": row.get("type", "") + ":" + str(row.get("payload", {}).get("type", ""))}
-                            continue
+                            if any(digest(e["text"]) == signature_hash for e in state["intent"]):
+                                state["last_transport_record"] = {"signature": digest([kind, redact(text).strip()]), "transport": row.get("type", "") + ":" + str(row.get("payload", {}).get("type", ""))}
+                                continue
                         transport = row.get("type", "") + ":" + str(row.get("payload", {}).get("type", ""))
                         signature = digest([kind, redact(text).strip()])
                         prior = state.get("last_transport_record", {})
@@ -704,6 +727,12 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["version"] = VERSION
             state.pop("reviewed_hash", None)
             state.pop("failed_hash", None)
+            if state["policy_migrated_from"] == "1.2.1" and (state.get("transcript_path") or event.get("transcript_path")):
+                # Rebuild old packets polluted by automatic goal/skill envelopes.
+                state.pop("file_identity", None)
+                state.pop("subagent", None)
+                state.pop("last_transport_record", None)
+                state["completed"] = False
             reconcile_native_control_history(state, event, host)
             if state.get("older_intent_in_delta_or_transcript"):
                 if state.get("transcript_path") or event.get("transcript_path"):
