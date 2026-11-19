@@ -314,6 +314,34 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(state["pending"], original)
         self.assertTrue(state["last_review"]["suppressed_pending_intervention"])
 
+    def test_stop_can_replace_wait_when_a_new_result_changes_the_next_action(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Complete the import."))
+
+        def first_review(cfg, payload):
+            return {"intervene": True, "reason": "The import is still running.",
+                    "next_action": "Wait for the import return.", "proof_needed": "The import result.",
+                    "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {}}
+
+        self.run_event(self.event("Stop"), first_review)
+        self.run_event(self.event("PostToolUse", tool_name="check_import", tool_response="Import exited with no records saved."))
+
+        def next_review(cfg, payload):
+            result_id = next(e["id"] for e in payload["evidence"] if e["kind"] == "tool")
+            return {"intervene": True, "reason": "The import process exited without saving records.",
+                    "next_action": "Read the import error and recover the failed stage.",
+                    "proof_needed": "Recovery of the failed stage and saved records.",
+                    "supersedes_pending": True, "evidence_ids": [result_id]}, {"usage": {}}
+
+        output, state = self.run_event(self.event("Stop", stop_hook_active=True), next_review)
+        self.assertIn("decision", output)
+        self.assertEqual(state["interventions"], 2)
+        self.assertIn("superseded_pending_at", state["last_review"])
+        self.assertIn("recover the failed stage", state["pending"]["next_action"])
+
+        repeated, state = self.run_event(self.event("Stop", last_assistant_message="I intend to recover the failed stage."), next_review)
+        self.assertEqual(repeated, {})
+        self.assertEqual(state["interventions"], 2)
+
     def test_pretool_checkpoint_is_advisory_and_never_denies_the_tool(self):
         self.cfg["checkpoint_every"] = 1
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
