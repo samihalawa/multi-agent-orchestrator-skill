@@ -1,6 +1,6 @@
 interface:
   display_name: "Multi-Agent Orchestrator"
-  short_description: "Coordinate bounded independent work and verify the complete outcome."
+  short_description: "Coordinate work, maintain automatic intent oversight and verify outcomes."
   default_prompt: >-
     Use $multi-agent-orchestrator for complex, broad, recovery or explicitly
     parallel work. Bind the current request and proof layer, reuse verified
@@ -13,3 +13,6 @@ interface:
     retry quotas. Obtain applicable reviews without duplicate ceremony and verify
     every authorised outcome. Adapt communication to the user; examples never
     require a fixed opening phrase, section count or closing template.
+    When continuous oversight is requested, reuse fleet-babysitter ownership and
+    the native event adapter. Compare supported events and schedules by evidence,
+    preserve model mappings, and prove actual activation and correction delivery.
