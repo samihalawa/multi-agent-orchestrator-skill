@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -138,6 +138,9 @@ def real_prompt(text):
 def classify_prompt(text):
     """Separate runtime task envelopes from actual owner steering."""
     text = text.strip()
+    hook_feedback = re.fullmatch(r'<hook_prompt hook_run_id="[^"]+">([\s\S]*)</hook_prompt>', text)
+    if hook_feedback:
+        return "runtime_feedback", hook_feedback.group(1).strip()
     if text.startswith('<codex_internal_context source="goal">'):
         match = re.search(r"<objective>([\s\S]*?)</objective>", text)
         return ("task_request", match.group(1).strip()) if match else ("tool", text)
@@ -217,6 +220,14 @@ def records(row, host, line_number):
     kind = payload.get("type")
     if kind == "message" and payload.get("role") in {"user", "assistant"}:
         role, text = payload["role"], flatten(payload.get("content"))
+        metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+        if role == "user" and isinstance(metadata, dict):
+            parts = metadata.get("content_item_metadata")
+            if isinstance(parts, list) and parts and all(
+                isinstance(part, dict) and part.get("provenance") == {"type": "harness", "hook": True} for part in parts
+            ):
+                _, feedback = classify_prompt(text)
+                return [("runtime_feedback", feedback, str(payload.get("id") or source_id))]
         return [(role, text, str(payload.get("id") or source_id))] if role != "user" or real_prompt(text) else []
     if kind in {"function_call", "custom_tool_call"}:
         return [("action", str(payload.get("name")) + " " + flatten(payload.get("arguments", payload.get("input"))), str(payload.get("call_id") or source_id))]
@@ -346,7 +357,11 @@ def ingest(state, event, host):
         prompt = redact(event["prompt"]).strip()
         # The hook often precedes the matching transcript append. Treat those as
         # two transports of one event, preserving genuinely repeated later asks.
-        if digest(prompt) not in state.get("emitted_feedback_hashes", []) and not (state.get("human_revision", 0) > revision_before_read and state["evidence"] and state["evidence"][-1]["kind"] == "user" and state["evidence"][-1]["text"] == prompt):
+        captured_in_transcript = (
+            state.get("human_revision", 0) > revision_before_read and state["evidence"]
+            and state["evidence"][-1]["kind"] == "user" and state["evidence"][-1]["text"] == prompt
+        )
+        if classify_prompt(prompt)[0] != "runtime_feedback" and digest(prompt) not in state.get("emitted_feedback_hashes", []) and not captured_in_transcript:
             state["hook_prompt_serial"] = state.get("hook_prompt_serial", 0) + 1
             add_evidence(state, "user", prompt, "prompt:" + str(state["hook_prompt_serial"]) + ":" + digest(prompt)[:16])
             state["pending_hook_prompt"] = {"hash": digest(prompt)}
@@ -380,7 +395,7 @@ def reconcile_native_control_history(state, event, host):
             for kind, text, source_id in records(row, host, lines):
                 if kind == "control" and text == "interrupt":
                     control = {"interrupted": True, "source_id": "e:" + str(source_id), "line": lines}
-                elif kind == "user" and digest(redact(text).strip()) not in state.get("emitted_feedback_hashes", []):
+                elif kind == "user" and classify_prompt(text)[0] == "user" and digest(redact(text).strip()) not in state.get("emitted_feedback_hashes", []):
                     control = {"interrupted": False, "source_id": "e:" + str(source_id), "line": lines}
     if control is not None:
         state["interrupted"] = control["interrupted"]
@@ -743,6 +758,17 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["version"] = VERSION
             state.pop("reviewed_hash", None)
             state.pop("failed_hash", None)
+            misattributed = [entry for entry in state["intent"] if classify_prompt(entry["text"])[0] == "runtime_feedback"]
+            if misattributed:
+                ids = {entry["id"] for entry in misattributed}
+                state["intent"] = [entry for entry in state["intent"] if entry["id"] not in ids]
+                for entry in state["evidence"]:
+                    if entry["id"] in ids:
+                        entry["kind"], entry["text"] = classify_prompt(entry["text"])
+                pending = state.get("pending")
+                revision = state.get("human_revision", 0)
+                if pending and pending.get("human_revision") == revision - len(misattributed):
+                    pending["human_revision"] = revision
             if state["policy_migrated_from"] in {"1.2.0", "1.2.1"} and (state.get("transcript_path") or event.get("transcript_path")):
                 # Rebuild old packets polluted by automatic goal/skill envelopes.
                 state.pop("file_identity", None)
@@ -776,8 +802,6 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         # Interrupt and session end never restart a deliberately stopped executor.
         if name == "Interrupt":
             state["interrupted"] = True
-        elif name == "UserPromptSubmit" and state.get("human_revision", 0) > revision_before_event:
-            state["interrupted"] = False
         if name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
             state["events_since_review"] += 1
         payload = review_payload(state, event)

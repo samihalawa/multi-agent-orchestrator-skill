@@ -210,6 +210,42 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(state["intent"], [])
         self.assertTrue(g.real_prompt("The Intent observer: report needs reviewing"))
 
+    def test_native_wrapped_feedback_cannot_resume_an_interrupted_task(self):
+        feedback = "Intent observer: Verify the native result."
+        wrapper = '<hook_prompt hook_run_id="stop:11:/hooks.json">' + feedback + '</hook_prompt>'
+        transcript = self.root / "wrapped-feedback.jsonl"
+        rows = [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Verify the result"}},
+            {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user", "id": "hook-1",
+                "content": [{"type": "input_text", "text": wrapper}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_metadata": [{"provenance": {"type": "harness", "hook": True}}],
+                },
+            }},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        _, state = self.run_event(self.event("UserPromptSubmit", prompt=wrapper, transcript_path=str(transcript)))
+        self.assertTrue(state["interrupted"])
+        self.assertEqual(state["human_revision"], 1)
+        self.assertEqual([e["text"] for e in state["intent"]], ["Verify the result"])
+        self.assertIn({"id": "e:hook-1", "kind": "runtime_feedback", "text": feedback}, state["evidence"])
+
+    def test_upgrade_repairs_hook_feedback_counted_as_human_steering(self):
+        wrapper = '<hook_prompt hook_run_id="stop:11:/hooks.json">Review the remaining proof.</hook_prompt>'
+        state = g.initial_state("contract-test", "codex")
+        state["version"] = "1.2.3"
+        state["intent"] = [{"id": "e:hook-1", "kind": "user", "text": wrapper}]
+        state["evidence"] = state["intent"].copy()
+        state["human_revision"] = 3
+        state["pending"] = {"human_revision": 2}
+        g.atomic_save(self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json"), state)
+        _, amended = self.run_event(self.event("SessionStart"))
+        self.assertEqual(amended["intent"], [])
+        self.assertEqual(amended["evidence"][0]["kind"], "runtime_feedback")
+        self.assertEqual(amended["pending"]["human_revision"], amended["human_revision"])
+
     def test_same_owner_correction_after_assistant_reply_is_not_a_mirror(self):
         transcript = self.root / "repeated-owner.jsonl"
         rows = [
