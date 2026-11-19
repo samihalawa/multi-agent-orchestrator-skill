@@ -48,14 +48,16 @@ class GuardianContracts(unittest.TestCase):
         self.run_event(self.event("SessionStart"))
         self.assertEqual(self.calls, [])
 
-    def test_changed_checkpoint_calls_once_and_unchanged_stop_does_not(self):
+    def test_active_checkpoint_does_not_suppress_stop_closure_review(self):
         self.run_event(self.event("UserPromptSubmit", prompt="Implement the requested change"))
         for n in range(3):
             self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response=f"record {n}"))
         self.assertEqual(len(self.calls), 1)
         out, state = self.run_event(self.event("Stop"))
         self.assertEqual(out, {})
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)
+        _, state = self.run_event(self.event("Stop"))
+        self.assertEqual(len(self.calls), 2)
         self.assertEqual(state["status"], "unchanged evidence; no duplicate model call")
 
     def test_stop_feedback_uses_native_contract_and_no_repeat(self):
@@ -218,7 +220,7 @@ class GuardianContracts(unittest.TestCase):
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
         def evaluator(cfg, payload):
             return {"intervene": True, "reason": "A concrete route contradiction is present.", "next_action": "Read the actual saved setting.",
-                    "proof_needed": "Native setting readback.", "evidence_ids": [payload["evidence"][-1]["id"]]}, {"usage": {}}
+                    "proof_needed": "Native setting readback.", "evidence_ids": [payload["evidence"][-1]["id"]], "verdict_domain": "active_route"}, {"usage": {}}
         output, state = self.run_event(self.event("PreToolUse", tool_name="read_file", tool_input={"file": "actual-path"}), evaluator)
         self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "PreToolUse")
         self.assertNotIn("permissionDecision", output["hookSpecificOutput"])
@@ -228,6 +230,163 @@ class GuardianContracts(unittest.TestCase):
         schema = g.native_schema()
         self.assertIn("summarized_intent_ids", schema["required"])
         self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["properties"]["verdict_domain"]["enum"], ["active_route", "closure", "none"])
+
+    def test_missing_config_defaults_to_qualified_native_luna_without_api_calls(self):
+        config = g.load_config(self.root / "absent-config.json")
+        self.assertEqual(config["backend"], "codex_subscription")
+        self.assertEqual(config["model"], "gpt-6-luna")
+        self.assertEqual(config["reasoning_effort"], "low")
+        self.assertEqual(config["request_timeout"], 40)
+        self.assertEqual(self.calls, [])
+
+    def test_explicit_configured_provider_and_model_are_preserved(self):
+        path = self.root / "explicit-config.json"
+        path.write_text(json.dumps({"backend": "openrouter", "model": "explicit-owner-model", "request_timeout": 55}))
+        config = g.load_config(path)
+        self.assertEqual(config["backend"], "openrouter")
+        self.assertEqual(config["model"], "explicit-owner-model")
+        self.assertEqual(config["request_timeout"], 55)
+
+    def test_live_redundant_six_file_proof_warning_is_deferred_while_verifying(self):
+        # Regression from actual live observation: a committed version bump was
+        # followed by an active six-file equality check, not a proposed Stop.
+        self.cfg["checkpoint_every"] = 1
+        self.run_event(self.event("UserPromptSubmit", prompt="Publish the skill and verify all six payload files."))
+        def closure_warning(cfg, payload):
+            return {"intervene": True, "completed": False, "verdict_domain": "closure",
+                    "reason": "The patch-version bump was committed and pushed, but full six-file remote equality is not yet verified; continue rather than stop.",
+                    "next_action": "Compare each of the six payload files.", "proof_needed": "Six matching hashes.",
+                    "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {}}
+        output, state = self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="Version bump was committed; equality verification is in progress.",
+            last_assistant_message="I’m verifying each of the six payload files."), closure_warning)
+        self.assertEqual(output, {})
+        self.assertEqual(state.get("interventions", 0), 0)
+        self.assertIsNone(state["pending"])
+        self.assertEqual(state["last_review"]["deferred_model_verdict"]["domain"], "closure")
+        self.assertFalse(state["last_review"]["decision"]["intervene"])
+        self.assertIn("PHASE ISOLATION", g.policy_text(g.review_payload(state, self.event("PostToolUse"))))
+
+    def test_active_checkpoint_cannot_mark_whole_task_complete(self):
+        decision, deferred = g.guard_review_phase({"intervene": False, "completed": True, "verdict_domain": "closure"}, {"event": "PostToolUse"})
+        self.assertFalse(decision["completed"])
+        self.assertIsNotNone(deferred)
+
+    def test_actual_stop_keeps_closure_warning_enabled(self):
+        decision, deferred = g.guard_review_phase({"intervene": True, "completed": False, "verdict_domain": "closure"}, {"event": "Stop"})
+        self.assertTrue(decision["intervene"])
+        self.assertIsNone(deferred)
+        self.assertNotIn("PHASE ISOLATION", g.policy_text({"event": "Stop"}))
+
+    def test_completion_and_resolution_can_share_new_primary_tool_citations(self):
+        payload = {"event": "Stop", "intent": [], "evidence": [{"id": "e:new-proof", "kind": "tool"}],
+                   "pending_correction": {"review_evidence_ids": ["e:old"]}}
+        g.validate_decision({"intervene": False, "completed": True, "resolved": True, "verdict_domain": "closure",
+                            "evidence_ids": [], "resolution_evidence_ids": ["e:new-proof"]}, payload)
+
+    def test_assistant_done_claim_alone_cannot_prove_completion(self):
+        with self.assertRaises(ValueError):
+            g.validate_decision({"intervene": False, "completed": True, "verdict_domain": "closure", "evidence_ids": ["e:claim"]},
+                                {"event": "Stop", "intent": [], "evidence": [{"id": "e:claim", "kind": "assistant", "text": "Done"}]})
+
+    def test_invalid_decision_diagnostic_preserves_fields_without_raw_prompt(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Verify the actual result."))
+        def invalid(cfg, payload):
+            return {"intervene": False, "completed": True, "verdict_domain": "closure", "evidence_ids": [],
+                    "reason": "No cited proof; incidental token sk-or-v1-contracttest"}, {"usage": {"input_tokens": 10}}
+        output, state = self.run_event(self.event("Stop"), invalid)
+        self.assertEqual(output, {})
+        self.assertTrue(state["last_invalid_decision"]["decision"]["completed"])
+        self.assertEqual(state["last_invalid_decision"]["decision"]["evidence_ids"], [])
+        self.assertNotIn("sk-or-v1-contracttest", json.dumps(state["last_invalid_decision"]))
+        self.assertEqual(state["last_review_failure_metrics"]["usage"]["input_tokens"], 10)
+
+    def test_v11_state_upgrade_preserves_unsummarized_owner_intent(self):
+        _, state = self.run_event(self.event("UserPromptSubmit", prompt="Preserve all these actual scope constraints."))
+        state["version"] = "1.1.0"
+        state["reviewed_hash"] = "old-phase-blind-cache"
+        file = self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json")
+        g.atomic_save(file, state)
+        _, upgraded = self.run_event(self.event("SessionStart"))
+        self.assertEqual(upgraded["version"], "1.2.0")
+        self.assertEqual(upgraded["intent"], state["intent"])
+        self.assertEqual(upgraded["policy_migrated_from"], "1.1.0")
+        self.assertNotIn("reviewed_hash", upgraded)
+
+    def test_codex_native_abort_suppresses_background_feedback_until_real_user_resumes(self):
+        self.cfg["checkpoint_every"] = 1
+        transcript = self.root / "native-abort.jsonl"
+        rows = [
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Implement requested change"}},
+            {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "background", "output": "Background result arrived"}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        output, state = self.run_event(self.event("PostToolUse", transcript_path=str(transcript), tool_name="background", tool_response="Background result"))
+        self.assertEqual(output, {})
+        self.assertTrue(state["interrupted"])
+        self.assertEqual(state["interrupt_origin"]["host"], "codex")
+        self.assertEqual(self.calls, [])
+        continuation = "Intent observer: Old scope. Next action: Continue old work. Verify: Actual proof."
+        state["emitted_feedback_hashes"] = [g.digest(continuation)]
+        g.atomic_save(self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json"), state)
+        _, state = self.run_event(self.event("UserPromptSubmit", prompt=continuation))
+        self.assertTrue(state["interrupted"])
+        with transcript.open("a") as stream:
+            stream.write(json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Continue with this newly stated scope"}}) + "\n")
+        _, state = self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="New scoped result"))
+        self.assertFalse(state["interrupted"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_claude_native_interrupt_marker_is_control_not_owner_goal(self):
+        for marker in ["[Request interrupted by user]", "[Request interrupted by user for tool use]"]:
+            row = {"type": "user", "uuid": marker, "message": {"content": marker}}
+            self.assertEqual(g.records(row, "claude", 1), [("control", "interrupt", marker)])
+            row["isMeta"] = True
+            self.assertEqual(g.records(row, "claude", 1), [("control", "interrupt", marker)])
+        state = g.initial_state("claude-contract", "claude")
+        g.add_evidence(state, "user", "Original authorized task", "u1")
+        g.add_evidence(state, "control", "interrupt", "cancel")
+        self.assertTrue(state["interrupted"])
+        self.assertEqual(len(state["intent"]), 1)
+        g.add_evidence(state, "tool", "Late background output", "late-result")
+        self.assertTrue(state["interrupted"])
+        g.add_evidence(state, "user", "Resume the revised task", "u2")
+        self.assertFalse(state["interrupted"])
+        self.assertEqual(len(state["intent"]), 2)
+
+    def test_upgrade_recovers_native_cancellation_without_losing_cached_intent(self):
+        transcript = self.root / "preupgrade-cancel.jsonl"
+        rows = [{"type": "event_msg", "payload": {"type": "user_message", "message": "Original task"}},
+                {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}}]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        state = g.initial_state("contract-test", "codex")
+        g.add_evidence(state, "user", "Original task", "cached-owner-id")
+        state.update(version="1.1.0", transcript_path=str(transcript), offset=transcript.stat().st_size, line=2,
+                     file_identity=[transcript.stat().st_dev, transcript.stat().st_ino])
+        cached = list(state["intent"])
+        g.atomic_save(self.root / "state" / (g.digest(["codex", "contract-test"])[:32] + ".json"), state)
+        output, upgraded = self.run_event(self.event("Stop"))
+        self.assertEqual(output, {})
+        self.assertTrue(upgraded["interrupted"])
+        self.assertEqual(upgraded["intent"], cached)
+        self.assertEqual(upgraded["native_control_reconciliation"]["line"], 2)
+        self.assertEqual(self.calls, [])
+
+    def test_native_interruption_during_review_discards_older_feedback(self):
+        transcript = self.root / "interrupt-inflight.jsonl"
+        transcript.write_text(json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Original task"}}) + "\n")
+        self.run_event(self.event("SessionStart", transcript_path=str(transcript)))
+        def interrupted(cfg, payload):
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}}) + "\n")
+            return {"intervene": True, "verdict_domain": "closure", "reason": "Older scope missing proof", "next_action": "Continue old action",
+                    "proof_needed": "Old proof", "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {}}
+        output, state = self.run_event(self.event("Stop"), interrupted)
+        self.assertEqual(output, {})
+        self.assertTrue(state["interrupted"])
+        self.assertEqual(state["last_review"]["discarded"], "native owner interruption")
+        self.assertEqual(state.get("interventions", 0), 0)
 
     def test_stop_event_metadata_cannot_be_mistaken_for_a_human_stop(self):
         state = g.initial_state("contract-test", "codex")
@@ -274,11 +433,14 @@ class GuardianContracts(unittest.TestCase):
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
         def done(cfg, payload):
             self.calls.append(payload)
-            return {"intervene": False, "completed": True, "evidence_ids": [payload["evidence"][-1]["id"]]}, {"usage": {}}
+            proof = next(entry for entry in reversed(payload["evidence"]) if entry["kind"] == "tool")
+            return {"intervene": False, "completed": True, "evidence_ids": [proof["id"]], "verdict_domain": "closure"}, {"usage": {}}
+        self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="Contract test output readback present."))
         self.run_event(self.event("Stop", last_assistant_message="Requested answer text is present here."), done)
         self.run_event(self.event("Stop", last_assistant_message="Additional status"), done)
         self.assertEqual(len(self.calls), 1)
         self.run_event(self.event("UserPromptSubmit", prompt="Now implement the follow-up"))
+        self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="Follow-up contract output readback present."))
         self.run_event(self.event("Stop", last_assistant_message="Requested follow-up output is present here."), done)
         self.assertEqual(len(self.calls), 2)
 
