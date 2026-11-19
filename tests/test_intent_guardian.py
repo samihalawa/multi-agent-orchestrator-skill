@@ -334,6 +334,23 @@ class GuardianContracts(unittest.TestCase):
         self.assertIsNone(deferred)
         self.assertNotIn("PHASE ISOLATION", g.policy_text({"event": "Stop"}))
 
+    def test_stop_review_tracks_native_background_status_changes(self):
+        job = {"id": "job-1", "status": "running", "type": "shell", "command": "private arguments"}
+        calls = []
+
+        def review(cfg, payload):
+            calls.append(payload["native_background_tasks"])
+            return {"intervene": False, "completed": False}, {}
+
+        self.run_event(self.event("UserPromptSubmit", prompt="Generate and verify the audio"))
+        self.run_event(self.event("Stop", background_tasks=[job]), review)
+        self.run_event(self.event("Stop", background_tasks=[job]), review)
+        self.run_event(self.event("Stop", background_tasks=[{**job, "status": "completed"}]), review)
+        self.assertEqual(calls, [
+            [{"id": "job-1", "status": "running", "type": "shell"}],
+            [{"id": "job-1", "status": "completed", "type": "shell"}],
+        ])
+
     def test_completion_and_resolution_can_share_new_primary_tool_citations(self):
         payload = {"event": "Stop", "intent": [], "evidence": [{"id": "e:new-proof", "kind": "tool"}],
                    "pending_correction": {"review_evidence_ids": ["e:old"]}}

@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -51,6 +51,13 @@ A correction must CHANGE the executor's currently selected next action. If its
 latest compatible plan already performs the proposed action, stay quiet at an
 active checkpoint. Repeating that plan or requesting its future proof early adds
 no correction. Pending proof alone is not a failure during ongoing work.
+At Stop the selected action is ending the turn. A promise to check later does
+not show that the session will resume. If a remaining action is feasible now,
+judge the proposed stop against that action. If work genuinely must wait, check
+for evidence that a background job or provider response will return control to
+this task. Native background task status is evidence only for that exact job.
+An absent native field means status is unknown. Do not demand repeated polling
+or a new schedule when the existing wait and continuation are supported.
 Honor actual user stop/read-only instructions, legitimate provider waits and
 completed outcomes. Never invent requirements, facts, provider results, access,
 urgency, or authority. Do not restart completed tasks or require endless reviews.
@@ -446,7 +453,16 @@ def review_payload(state, event):
                "PreToolUse": "Executor is actively working; checkpoint before its next tool",
                "PostToolUse": "Executor is actively working; checkpoint after its tool",
                "PostToolUseFailure": "Executor is actively working; its tool failed and may need a changed route"}.get(name, "Observation-only lifecycle event")
+    native_tasks = event.get("background_tasks")
+    background_tasks = None
+    if name == "Stop" and isinstance(native_tasks, list):
+        background_tasks = [
+            {key: redact(bounded(task[key], 240))
+             for key in ("id", "type", "status", "description") if isinstance(task.get(key), str)}
+            for task in native_tasks if isinstance(task, dict)
+        ]
     return {"event": name, "event_semantics": meaning, "executor_proposed_final_stop": name == "Stop", "review_phase": "closure" if name == "Stop" else "active_route", "session_id": state["session_id"],
+            "native_background_tasks": background_tasks,
             "intent": state["intent"], "prior_state_delta": state["state_delta"],
             "pending_correction": state.get("pending"), "evidence": evidence,
             "coverage": {"transcript_lines_parsed": state["line"], "malformed": state["malformed_lines"],
@@ -727,7 +743,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["version"] = VERSION
             state.pop("reviewed_hash", None)
             state.pop("failed_hash", None)
-            if state["policy_migrated_from"] == "1.2.1" and (state.get("transcript_path") or event.get("transcript_path")):
+            if state["policy_migrated_from"] in {"1.2.0", "1.2.1"} and (state.get("transcript_path") or event.get("transcript_path")):
                 # Rebuild old packets polluted by automatic goal/skill envelopes.
                 state.pop("file_identity", None)
                 state.pop("subagent", None)
@@ -765,7 +781,8 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         if name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
             state["events_since_review"] += 1
         payload = review_payload(state, event)
-        content_hash = digest({k: payload[k] for k in ["review_phase", "intent", "evidence"]})
+        hash_fields = {key: payload[key] for key in ("review_phase", "intent", "evidence", "native_background_tasks")}
+        content_hash = digest(hash_fields)
         due = force or name == "Stop" or name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"} and state["events_since_review"] >= int(cfg["checkpoint_every"])
         why = "observed"
         if state.get("subagent") or os.environ.get("INTENT_GUARDIAN_OBSERVER") == "1":
@@ -821,7 +838,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 state["events_since_review"] = 0
                 state["state_delta"] = redact(bounded(decision.get("state_delta", ""), 1800))
                 compact_reviewed_intent(state, decision)
-                state["reviewed_hash"] = digest({"review_phase": payload["review_phase"], "intent": state["intent"], "evidence": state["evidence"]})
+                state["reviewed_hash"] = digest({**hash_fields, "intent": state["intent"], "evidence": state["evidence"]})
                 state.pop("model_error", None)
                 if decision.get("resolved"):
                     state["last_resolution"] = {"at": time.time(), "evidence_ids": decision.get("resolution_evidence_ids"), "correction": state.get("pending")}
