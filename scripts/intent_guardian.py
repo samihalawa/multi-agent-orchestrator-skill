@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.6"
+VERSION = "1.2.7"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -81,14 +81,14 @@ On the same human request, keep an unresolved correction pending without
 reissuing it. Polling or seeing the same unfinished condition with a new
 timestamp is not a new defect. A later owner direction or native proof that
 the original route is no longer needed can supersede the instruction.
-At Stop, set supersedes_pending:true only when a newly cited primary tool
-result materially changes the exact next action for an unresolved correction.
-A repeated status, paraphrase, or promise does not qualify. Keep unresolved
-scope in the new next action and proof. Otherwise set it false.
+At Stop, propose an updated correction only when a newly cited primary tool
+result materially changes the required action or disproves the executor's
+new completion claim. A repeated status, paraphrase, or promise does not
+qualify. Keep unresolved scope in the new next action and proof.
 Return JSON only with keys:
 {"intervene":boolean,"reason":string,"next_action":string,"proof_needed":string,
  "evidence_ids":[string],"resolved":boolean,"resolution_evidence_ids":[string],
- "completed":boolean,"supersedes_pending":boolean,"state_delta":string,"summarized_intent_ids":[string],
+ "completed":boolean,"state_delta":string,"summarized_intent_ids":[string],
  "verdict_domain":"active_route"|"closure"|"none"}.
 Every intervention, resolution AND completed:true verdict MUST cite IDs present
 in supplied evidence. For completion, evidence_ids must cite the actual primary
@@ -556,7 +556,7 @@ def guard_review_phase(decision, payload):
 
 def native_schema():
     properties = {key: {"type": "string"} for key in ["reason", "next_action", "proof_needed", "state_delta"]}
-    properties.update({key: {"type": "boolean"} for key in ["intervene", "resolved", "completed", "supersedes_pending"]})
+    properties.update({key: {"type": "boolean"} for key in ["intervene", "resolved", "completed"]})
     properties.update({key: {"type": "array", "items": {"type": "string"}} for key in ["evidence_ids", "resolution_evidence_ids", "summarized_intent_ids"]})
     properties["verdict_domain"] = {"type": "string", "enum": ["active_route", "closure", "none"]}
     return {"type": "object", "additionalProperties": False, "properties": properties, "required": list(properties)}
@@ -718,13 +718,14 @@ def emit_correction(event, decision, host="codex"):
 
 
 def supersedes_pending_stop(decision, payload, pending):
-    if (not pending or payload["event"] != "Stop" or decision["verdict_domain"] != "closure"
-            or decision.get("supersedes_pending") is not True):
+    if not pending or payload["event"] != "Stop" or decision["verdict_domain"] != "closure":
         return False
     if " ".join(decision["next_action"].split()) == " ".join(pending.get("next_action", "").split()):
         return False
     new_citations = set(decision["evidence_ids"]) - set(pending.get("review_evidence_ids", []))
-    return any(e["id"] in new_citations and e["kind"] == "tool" for e in payload["evidence"])
+    earlier_tool_results = set(pending.get("review_tool_digests", []))
+    return any(e["id"] in new_citations and e["kind"] == "tool" and digest(e["text"]) not in earlier_tool_results
+               for e in payload["evidence"])
 
 
 @contextlib.contextmanager
@@ -901,6 +902,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                         state["emitted_feedback_hashes"] = (state.get("emitted_feedback_hashes", []) + [digest(feedback.strip())])[-16:]
                         state["last_correction_hash"] = correction_hash
                         state["pending"] = {"verdict_domain": decision["verdict_domain"], "reason": bounded(decision["reason"], 650), "next_action": bounded(decision["next_action"], 900), "proof_needed": bounded(decision["proof_needed"], 650), "evidence_ids": decision["evidence_ids"], "review_evidence_ids": [e["id"] for e in payload["evidence"]], "human_revision": current_revision, "at": time.time()}
+                        state["pending"]["review_tool_digests"] = [digest(e["text"]) for e in payload["evidence"] if e["kind"] == "tool"]
                         if supersedes:
                             state["last_review"]["superseded_pending_at"] = pending.get("at")
                         state["interventions"] = state.get("interventions", 0) + 1

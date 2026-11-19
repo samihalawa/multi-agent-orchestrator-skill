@@ -330,7 +330,7 @@ class GuardianContracts(unittest.TestCase):
             return {"intervene": True, "reason": "The import process exited without saving records.",
                     "next_action": "Read the import error and recover the failed stage.",
                     "proof_needed": "Recovery of the failed stage and saved records.",
-                    "supersedes_pending": True, "evidence_ids": [result_id]}, {"usage": {}}
+                    "evidence_ids": [result_id]}, {"usage": {}}
 
         output, state = self.run_event(self.event("Stop", stop_hook_active=True), next_review)
         self.assertIn("decision", output)
