@@ -23,7 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.7"
+VERSION = "1.2.8"
+GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
@@ -149,6 +150,8 @@ def classify_prompt(text):
     hook_feedback = re.fullmatch(r'<hook_prompt hook_run_id="[^"]+">([\s\S]*)</hook_prompt>', text)
     if hook_feedback:
         return "runtime_feedback", hook_feedback.group(1).strip()
+    if text.startswith(GUARDIAN_TAG + " "):
+        return "runtime_feedback", text
     if text.startswith('<codex_internal_context source="goal">'):
         match = re.search(r"<objective>([\s\S]*?)</objective>", text)
         return ("task_request", match.group(1).strip()) if match else ("tool", text)
@@ -711,7 +714,7 @@ def validate_decision(decision, payload):
 
 
 def emit_correction(event, decision, host="codex"):
-    correction = "Intent observer: " + bounded(decision["reason"], 650) + " Next action: " + bounded(decision["next_action"], 900) + " Verify: " + bounded(decision["proof_needed"], 650)
+    correction = GUARDIAN_TAG + " " + bounded(decision["reason"], 650) + " Next action: " + bounded(decision["next_action"], 900) + " Verify: " + bounded(decision["proof_needed"], 650)
     if event == "Stop" and host == "codex":
         return {"decision": "block", "reason": correction}
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": correction}}

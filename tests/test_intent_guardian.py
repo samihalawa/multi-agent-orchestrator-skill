@@ -217,6 +217,17 @@ class GuardianContracts(unittest.TestCase):
         g.add_evidence(state, "action", prompt, "delegation")
         self.assertEqual(state["evidence"][-1]["text"], prompt)
 
+    def test_every_correction_channel_starts_with_guardian_tag(self):
+        decision = {"reason": "The requested result remains open.",
+                    "next_action": "Read back the result.", "proof_needed": "Primary result."}
+        for host in ("codex", "claude"):
+            for event in ("Stop", "PostToolUse", "PreToolUse", "PostToolUseFailure"):
+                with self.subTest(host=host, event=event):
+                    output = g.emit_correction(event, decision, host)
+                    message = output.get("reason") or output["hookSpecificOutput"]["additionalContext"]
+                    self.assertTrue(message.startswith("[SAMI'S INTENT GUARDIAN] "))
+                    self.assertEqual(g.classify_prompt(message), ("runtime_feedback", message))
+
     def test_native_wrapped_feedback_cannot_resume_an_interrupted_task(self):
         feedback = "Intent observer: Verify the native result."
         wrapper = '<hook_prompt hook_run_id="stop:11:/hooks.json">' + feedback + '</hook_prompt>'
