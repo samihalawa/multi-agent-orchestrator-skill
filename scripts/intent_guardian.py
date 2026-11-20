@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.8"
+VERSION = "1.2.9"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -48,6 +48,11 @@ failed route, missing known context, implementation replaced by a report, lost
 work, or unsupported completion. These are examples, not a fixed classifier.
 Normal progress is not a defect because later work is still pending. Unknown
 proof is not proof of failure. A stated future plan is not a completed action.
+Earlier runtime feedback is never owner authorization. Tie any proposed source
+edit, install or provider action to the current owner request or a still
+applicable earlier owner instruction supported by the evidence. A request to
+assess whether a live system works, or how to improve it, can be fulfilled with
+verified findings. Require implementation only when the owner asked for it.
 Check the exact scope clause and any exceptions before alleging an unauthorized
 action. A clipped delegation can omit the governing exception. Missing portions
 cannot establish a rule or a contradiction, and an observer cannot invent a
@@ -182,6 +187,11 @@ def records(row, host, line_number):
         if row.get("isSidechain"):
             return []
         typ = row.get("type")
+        attachment = row.get("attachment", {})
+        if typ == "attachment" and isinstance(attachment, dict) and attachment.get("type") == "hook_additional_context":
+            return [("runtime_feedback", text, f"{source_id}:{i}")
+                    for i, text in enumerate(attachment.get("content") or [])
+                    if isinstance(text, str) and text.startswith(GUARDIAN_TAG + " ")]
         msg = row.get("message", {})
         content = msg.get("content", "") if isinstance(msg, dict) else ""
         if typ == "user" and flatten(content).strip() in CLAUDE_INTERRUPT_MARKERS:
@@ -347,6 +357,11 @@ def ingest(state, event, host):
                             state["subagent"] = bool(meta.get("thread_source") == "subagent"
                                                      or isinstance(source, dict) and source.get("subagent"))
                     for kind, text, sid in records(row, host, state["line"]):
+                        if kind == "runtime_feedback":
+                            correction = state.get("corrections", {}).get(digest(text.strip()))
+                            if correction is not None:
+                                correction.setdefault("delivery", {"source_id": str(sid), "line": state["line"],
+                                                                   "transcript": str(path)})
                         hook_prompt = state.get("pending_hook_prompt", {})
                         signature_hash = digest(redact(text).strip())
                         if kind == "user" and signature_hash == hook_prompt.get("hash"):
@@ -565,23 +580,42 @@ def native_schema():
     return {"type": "object", "additionalProperties": False, "properties": properties, "required": list(properties)}
 
 
+class ReviewBackendError(RuntimeError):
+    def __init__(self, category, detail):
+        super().__init__(detail)
+        self.category = category
+
+
+def native_exit_category(diagnostics):
+    # Inspect transient provider diagnostics; persist only the matched category.
+    for category, pattern in (
+        ("quota", r"usage limit|rate.limit|spending.limit|quota|(?:status|http)\s*(?:code[ :]+)?(?:402|429)\b"),
+        ("auth", r"unauthorized|authentication failed|token expired|(?:status|http)\s*(?:code[ :]+)?(?:401|403)\b"),
+        ("timeout", r"timed? out|deadline exceeded"),
+        ("unavailable", r"connection (?:reset|refused)|service unavailable|(?:status|http)\s*(?:code[ :]+)?50[234]\b"),
+    ):
+        if re.search(pattern, diagnostics, re.IGNORECASE):
+            return category
+    return "native_exit"
+
+
 def call_native_model(cfg, payload):
     """Use a proved, isolated native subscription profile; never the executor's session."""
     bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
     executable = cfg.get("codex_command") or (str(bundled) if bundled.is_file() else shutil.which("codex"))
     if not executable:
-        raise RuntimeError("Configured native Codex executable is unavailable")
+        raise ReviewBackendError("configuration", "Configured native Codex executable is unavailable")
     review_home = Path(cfg.get("native_home", str(Path.home() / ".config/intent-guardian/native-home"))).expanduser()
     auth_source = Path(cfg.get("native_auth_source", str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"))).expanduser()
     if not auth_source.is_file():
-        raise RuntimeError("Native subscription auth source is not an accessible file")
+        raise ReviewBackendError("auth", "Native subscription auth source is not an accessible file")
     review_home.mkdir(parents=True, exist_ok=True)
     auth_link = review_home / "auth.json"
     if auth_link.is_symlink():
         if auth_link.resolve() != auth_source.resolve():
-            raise RuntimeError("Native review profile belongs to a different authentication source")
+            raise ReviewBackendError("auth", "Native review profile belongs to a different authentication source")
     elif auth_link.exists():
-        raise RuntimeError("Native review profile has independent authentication; preserved unchanged")
+        raise ReviewBackendError("auth", "Native review profile has independent authentication; preserved unchanged")
     else:
         auth_link.symlink_to(auth_source.resolve())
     args = [str(executable), "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
@@ -609,8 +643,6 @@ def call_native_model(cfg, payload):
         args.extend(["--output-schema", str(schema_path), "-"])
         proc = subprocess.run(args, input=json.dumps(payload, ensure_ascii=False), capture_output=True, text=True,
                               timeout=float(cfg.get("request_timeout", 40)), env=child_env, cwd=str(review_home))
-    if proc.returncode:
-        raise RuntimeError("Native observer exited " + str(proc.returncode) + "; executor state preserved")
     final = ""
     usage = {}
     thread_id = None
@@ -630,11 +662,18 @@ def call_native_model(cfg, payload):
                 final = item.get("text", "")
             elif item.get("type") not in {"reasoning", "error"}:
                 tool_events.append(item.get("type"))
-    if tool_events:
-        raise RuntimeError("Read-only observer unexpectedly emitted tool events; judgment discarded")
     metrics = {"model": cfg["model"], "usage": usage, "latency_ms": round((time.monotonic() - started) * 1000),
                "provider_id": thread_id, "billing_basis": "Existing Codex subscription; native tokens reported, dollar charge not reported",
                "backend": "codex_subscription"}
+    if proc.returncode:
+        error = ReviewBackendError(native_exit_category(proc.stderr + "\n" + proc.stdout),
+                                   f"Native observer exited {proc.returncode}; executor state preserved")
+        error.guardian_metrics = metrics
+        raise error
+    if tool_events:
+        error = RuntimeError("Read-only observer unexpectedly emitted tool events; judgment discarded")
+        error.guardian_metrics = metrics
+        raise error
     try:
         decision = parse_model_json(final)
     except (ValueError, TypeError) as exc:
@@ -661,7 +700,8 @@ def call_model(cfg, payload):
             data = json.load(response)
     except urllib.error.HTTPError as exc:
         # Provider error bodies can contain echoed credentials/request data.
-        raise RuntimeError(f"Observer provider HTTP {exc.code}") from None
+        category = {401: "auth", 403: "auth", 402: "quota", 429: "quota"}.get(exc.code, "provider_http")
+        raise ReviewBackendError(category, f"Observer provider HTTP {exc.code}") from None
     choice = data.get("choices", [{}])[0]
     metrics = {"model": data.get("model", cfg["model"]), "usage": data.get("usage", {}),
                "latency_ms": round((time.monotonic() - started) * 1000), "provider_id": data.get("id")}
@@ -767,6 +807,43 @@ def atomic_save(path, data):
             os.unlink(temp)
 
 
+def backend_gate(path, timeout, *, started=None, failure=None):
+    """Share cooldown across sessions, with one in-flight recovery probe."""
+    with state_lock(path.with_suffix(".lock")):
+        retry = json.loads(path.read_text()) if path.is_file() else {}
+        now = time.time()
+        if started is None:
+            if retry.get("retry_at", 0) > now:
+                return None, retry
+            if retry:
+                atomic_save(path, {**retry, "retry_at": now + timeout + 5, "probe_started": now})
+            return now, retry
+        if retry.get("failed_at", 0) > started or retry.get("probe_started", 0) > started:
+            return None, retry
+        if failure:
+            interval = min(900, 60 * 2 ** min(retry.get("failures", 0), 4))
+            retry = {"failed_at": now, "retry_at": now + interval, "failures": retry.get("failures", 0) + 1,
+                     "category": failure}
+            atomic_save(path, retry)
+        elif retry:
+            path.unlink()
+        return None, retry
+
+
+def record_review_usage(state, metrics):
+    usage = metrics.get("usage", {})
+    totals = state.setdefault("observed_review_tokens", {})
+    for name in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"):
+        aliases = {"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens"}
+        value = usage.get(name, usage.get(aliases.get(name)))
+        if name == "cached_input_tokens" and value is None:
+            value = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if type(value) is int and value >= 0:
+            totals[name] = totals.get(name, 0) + value
+    state["reviews_with_token_usage"] = state.get("reviews_with_token_usage", 0) + int(
+        "input_tokens" in usage or "prompt_tokens" in usage)
+
+
 def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False):
     session_id = str(event.get("session_id") or event.get("sessionId") or "")
     name = event.get("hook_event_name", "")
@@ -846,11 +923,22 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             due, why = False, "source unavailable; no unsupported judgment issued"
         elif content_hash == state.get("reviewed_hash"):
             due, why = False, "unchanged evidence; no duplicate model call"
-        elif content_hash == state.get("failed_hash") and time.time() - state.get("failure_at", 0) < 300:
+        elif content_hash == state.get("failed_hash") and not state.get("backend_cooldown") and time.time() - state.get("failure_at", 0) < 300:
             due, why = False, "unchanged failed audit; waiting for new evidence or retry window"
         elif state.get("completed") and name != "UserPromptSubmit":
             due, why = False, "verified completed task remains closed"
         output = {}
+        if due:
+            backend_key = digest([cfg.get(k) for k in ("backend", "model", "native_home", "native_auth_source", "api_base")])[:24]
+            gate = state_dir / "backend" / (backend_key + ".json")
+            timeout = float(cfg.get("request_timeout", 40))
+            started, retry = backend_gate(gate, timeout)
+            if started is None:
+                due, why = False, "observer backend cooling down; host continues"
+                state["backend_cooldown"] = retry
+                state["reviews_skipped_backend_cooldown"] = state.get("reviews_skipped_backend_cooldown", 0) + 1
+            else:
+                state.pop("backend_cooldown", None)
         if due:
             metrics = {}
             metrics_accounted = False
@@ -858,6 +946,8 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["model_calls"] += 1
             try:
                 decision, metrics = reviewer(cfg, payload)
+                backend_gate(gate, timeout, started=started)
+                record_review_usage(state, metrics)
                 state["cost_usd"] += float(metrics.get("usage", {}).get("cost") or 0)
                 if "cost" not in metrics.get("usage", {}):
                     state["requests_without_reported_cost"] = state.get("requests_without_reported_cost", 0) + 1
@@ -891,6 +981,10 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 state.pop("model_error", None)
                 if decision.get("resolved"):
                     state["last_resolution"] = {"at": time.time(), "evidence_ids": decision.get("resolution_evidence_ids"), "correction": state.get("pending")}
+                    pending_record = state.get("corrections", {}).get((state.get("pending") or {}).get("feedback_hash"))
+                    if pending_record is not None:
+                        pending_record["outcome"] = {"status": "verified", "at": time.time(),
+                                                     "evidence_ids": decision.get("resolution_evidence_ids", [])}
                     state["pending"] = None
                 if decision.get("intervene"):
                     correction_hash = digest({k: decision.get(k) for k in ["reason", "next_action", "proof_needed", "evidence_ids"]})
@@ -902,10 +996,17 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     if can_emit and correction_hash != state.get("last_correction_hash"):
                         output = emit_correction(name, decision, host)
                         feedback = output.get("reason") or output.get("hookSpecificOutput", {}).get("additionalContext", "")
-                        state["emitted_feedback_hashes"] = (state.get("emitted_feedback_hashes", []) + [digest(feedback.strip())])[-16:]
+                        feedback_hash = digest(feedback.strip())
+                        state["emitted_feedback_hashes"] = (state.get("emitted_feedback_hashes", []) + [feedback_hash])[-16:]
+                        corrections = state.setdefault("corrections", {})
+                        previous = corrections.get((pending or {}).get("feedback_hash"))
+                        if previous is not None:
+                            previous["outcome"] = {"status": "superseded", "at": time.time(), "replacement": feedback_hash}
+                        corrections[feedback_hash] = {"emitted_at": time.time(), "event": name, "outcome": {"status": "pending"}}
                         state["last_correction_hash"] = correction_hash
                         state["pending"] = {"verdict_domain": decision["verdict_domain"], "reason": bounded(decision["reason"], 650), "next_action": bounded(decision["next_action"], 900), "proof_needed": bounded(decision["proof_needed"], 650), "evidence_ids": decision["evidence_ids"], "review_evidence_ids": [e["id"] for e in payload["evidence"]], "human_revision": current_revision, "at": time.time()}
                         state["pending"]["review_tool_digests"] = [digest(e["text"]) for e in payload["evidence"] if e["kind"] == "tool"]
+                        state["pending"]["feedback_hash"] = feedback_hash
                         if supersedes:
                             state["last_review"]["superseded_pending_at"] = pending.get("at")
                         state["interventions"] = state.get("interventions", 0) + 1
@@ -918,6 +1019,14 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 if extra_metrics and not metrics_accounted:
                     state["cost_usd"] += float(extra_metrics.get("usage", {}).get("cost") or 0)
                     metrics = extra_metrics
+                    record_review_usage(state, metrics)
+                category = getattr(exc, "category", None)
+                if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+                    category = "timeout"
+                elif isinstance(exc, urllib.error.URLError):
+                    category = "unavailable"
+                if category:
+                    _, state["backend_cooldown"] = backend_gate(gate, timeout, started=started, failure=category)
                 if not metrics_accounted and "cost" not in metrics.get("usage", {}):
                     state["requests_without_reported_cost"] = state.get("requests_without_reported_cost", 0) + 1
                 state["last_review_failure_metrics"] = metrics
@@ -935,7 +1044,10 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                             value = "[invalid field type]"
                         diagnostic[key] = value
                     state["last_invalid_decision"] = {"at": time.time(), "event": name, "review_phase": payload["review_phase"], "decision": diagnostic}
-                state["model_error"] = {"at": time.time(), "type": type(exc).__name__, "message": redact(bounded(str(exc), 220))}
+                state["model_error"] = {"at": time.time(), "type": type(exc).__name__,
+                                        "category": category or "review_error",
+                                        "message": "Observer timed out; executor state preserved"
+                                        if isinstance(exc, subprocess.TimeoutExpired) else redact(bounded(str(exc), 220))}
                 state["failed_hash"], state["failure_at"] = content_hash, time.time()
                 state["model_failures"] = state.get("model_failures", 0) + 1
                 why = "model unavailable; host continues"
@@ -968,7 +1080,7 @@ def main(argv=None):
             except (ValueError, OSError):
                 continue
             if not args.session_id or state.get("session_id") == args.session_id:
-                states.append({k: state.get(k) for k in ["session_id", "host", "status", "last_event", "last_seen", "model_calls", "cost_usd", "requests_without_reported_cost", "billing_basis", "interventions", "completed", "pending", "last_resolution", "model_error", "scope_gap", "source_error", "line", "offset"]})
+                states.append({k: state.get(k) for k in ["session_id", "host", "status", "last_event", "last_seen", "model_calls", "cost_usd", "requests_without_reported_cost", "billing_basis", "interventions", "completed", "pending", "last_resolution", "model_error", "scope_gap", "source_error", "line", "offset", "corrections", "backend_cooldown", "reviews_skipped_backend_cooldown", "observed_review_tokens", "reviews_with_token_usage"]})
         print(json.dumps({"version": VERSION, "sessions": states}, ensure_ascii=False))
         return 0
     try:

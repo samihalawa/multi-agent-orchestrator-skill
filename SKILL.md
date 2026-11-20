@@ -226,6 +226,10 @@ separate from proof that a running or resumed session invoked the hook.
 Use a hook timeout at least five seconds above the configured model timeout.
 
 The adapter retains a compact per-session intent/proof delta and event metadata.
+It also records a correction's emission, native delivery when the receiving
+transcript confirms it, and its verified or superseded outcome. Token totals
+cover only reviews that reported usage. Backend failures pause reviews across
+sessions, with one recovery probe at the next eligible event after cooldown.
 Do not mirror raw conversations or create a second work queue. Observation-only
 events make no model request. Evaluate changed useful checkpoints and proposed
 stops; suppress unchanged feedback, verify actual correction evidence, respect

@@ -584,6 +584,62 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(g.redact("receipt SUB-1234"), "receipt SUB-1234")
         self.assertNotIn("abcdef", g.redact("sk-or-v1-abcdef"))
 
+    def test_backend_cooldown_spans_hosts_and_recovers_with_one_probe(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Check the requested record"))
+
+        def broken(cfg, payload):
+            raise g.ReviewBackendError("native_exit", "Native observer exited 1")
+
+        _, state = self.run_event(self.event("Stop"), broken)
+        self.assertEqual(state["model_error"]["category"], "native_exit")
+        state_dir = self.root / "state"
+        g.process_event({"session_id": "other", "hook_event_name": "UserPromptSubmit",
+                         "prompt": "Verify the queue"}, "claude", self.cfg, state_dir, self.reviewer)
+        _, other = g.process_event({"session_id": "other", "hook_event_name": "Stop"},
+                                   "claude", self.cfg, state_dir, self.reviewer)
+        self.assertEqual(other["model_calls"], 0)
+        self.assertEqual(other["reviews_skipped_backend_cooldown"], 1)
+        gate = next((state_dir / "backend").glob("*.json"))
+        retry = json.loads(gate.read_text())
+        g.atomic_save(gate, {**retry, "retry_at": 0})
+        started, _ = g.backend_gate(gate, 40)
+        self.assertIsNotNone(started)
+        self.assertIsNone(g.backend_gate(gate, 40)[0])
+        g.backend_gate(gate, 40, started=started)
+        self.assertFalse(gate.exists())
+
+    def test_native_claude_delivery_and_outcome_are_tied_to_same_correction(self):
+        transcript = self.root / "claude.jsonl"
+        transcript.write_text("")
+        state_dir = self.root / "state"
+
+        def run(name, reviewer, **extra):
+            event = self.event(name, transcript_path=str(transcript), **extra)
+            return g.process_event(event, "claude", self.cfg, state_dir, reviewer)
+
+        run("UserPromptSubmit", self.reviewer, prompt="Verify the generated file")
+
+        def correct(cfg, payload):
+            return {"intervene": True, "reason": "File readback is missing", "next_action": "Read the file",
+                    "proof_needed": "File readback", "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {"input_tokens": 35}}
+
+        output, state = run("Stop", correct)
+        correction = state["pending"]["feedback_hash"]
+        self.assertNotIn("delivery", state["corrections"][correction])
+        text = output["hookSpecificOutput"]["additionalContext"]
+        transcript.write_text(json.dumps({"type": "attachment", "uuid": "feedback",
+                                         "attachment": {"type": "hook_additional_context", "content": [text]}}) + "\n")
+        run("PostToolUse", self.reviewer, tool_name="read_file", tool_response="Generated file verified")
+
+        def resolve(cfg, payload):
+            proof = next(entry["id"] for entry in payload["evidence"] if entry["kind"] == "tool")
+            return {"resolved": True, "resolution_evidence_ids": [proof]}, {"usage": {"input_tokens": 45, "cached_input_tokens": 30}}
+
+        _, state = run("Stop", resolve)
+        self.assertEqual(state["corrections"][correction]["delivery"]["source_id"], "feedback:0")
+        self.assertEqual(state["corrections"][correction]["outcome"]["status"], "verified")
+        self.assertEqual(state["observed_review_tokens"], {"input_tokens": 80, "cached_input_tokens": 30})
+
     def test_verified_complete_stays_closed_until_a_new_prompt(self):
         self.run_event(self.event("UserPromptSubmit", prompt="Implement requested change"))
         def done(cfg, payload):
