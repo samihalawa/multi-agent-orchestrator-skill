@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.11"
+VERSION = "1.2.12"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -53,6 +53,12 @@ edit, install or provider action to the current owner request or a still
 applicable earlier owner instruction supported by the evidence. A request to
 assess whether a live system works, or how to improve it, can be fulfilled with
 verified findings. Require implementation only when the owner asked for it.
+Start with review_focus: read the latest owner instruction and the executor's
+current action or proposed reply first, then look back for compatible earlier
+requirements and primary results. A newer correction controls the part it
+changes. If the owner distinguishes the real objective from a display, example,
+or supporting artifact, judge progress against the real objective. Never turn an
+earlier delivered goal or a rejected approach into a new obligation.
 Check the exact scope clause and any exceptions before alleging an unauthorized
 action. A clipped delegation can omit the governing exception. Missing portions
 cannot establish a rule or a contradiction, and an observer cannot invent a
@@ -81,6 +87,10 @@ reports a missing expected banner; it does not ask to hide or disable the banner
 Apply that missing-versus-unwanted distinction to every feature and language.
 You cannot act on providers. Point the executor to ONE exact feasible next action
 and the actual evidence needed; do not issue generic exhortations or ask the user.
+Write the correction for the executor who has this conversation. Name the actual
+entity and the discrepancy in one sentence, then give the next concrete action
+and the specific readback it should produce. Use an exact action verb and known
+target. Include no recap, guessed command, or additional work outside that intent.
 If a prior correction exists, mark it resolved only with NEW cited evidence that
 shows the correction happened, not a promise or another assistant's done claim.
 On the same human request, keep an unresolved correction pending without
@@ -520,7 +530,18 @@ def review_payload(state, event):
              for key in ("id", "type", "status", "description") if isinstance(task.get(key), str)}
             for task in native_tasks if isinstance(task, dict)
         ]
+    latest_evidence = {}
+    for entry in evidence:
+        latest_evidence[entry["kind"]] = entry["id"]
+    proposed_id = "e:last:" + digest(event["last_assistant_message"])[:16] if event.get("last_assistant_message") else None
+    if proposed_id and not any(entry["id"] == proposed_id for entry in evidence):
+        proposed_id = None
+    review_focus = {"latest_owner_instruction_id": state["intent"][-1]["id"] if state["intent"] else None,
+                    "executor_message_id": proposed_id or latest_evidence.get("assistant"),
+                    "executor_action_id": latest_evidence.get("action"),
+                    "latest_tool_result_id": latest_evidence.get("tool")}
     return {"event": name, "event_semantics": meaning, "executor_proposed_final_stop": name == "Stop", "review_phase": "closure" if name == "Stop" else "active_route", "session_id": state["session_id"],
+            "review_focus": review_focus,
             "native_background_tasks": background_tasks,
             "intent": state["intent"], "prior_state_delta": state["state_delta"],
             "pending_correction": state.get("pending"), "evidence": evidence,
@@ -744,9 +765,14 @@ def validate_decision(decision, payload):
                 raise ValueError("Intervention omitted its precise action or proof")
     if decision.get("resolved"):
         cited_resolution = decision.get("resolution_evidence_ids", [])
-        old_ids = set((payload.get("pending_correction") or {}).get("review_evidence_ids", []))
-        if not isinstance(cited_resolution, list) or not cited_resolution or not set(cited_resolution) <= ids or not set(cited_resolution) - old_ids:
-            raise ValueError("Resolution did not cite new supplied evidence")
+        pending = payload.get("pending_correction")
+        if not pending or not isinstance(cited_resolution, list) or not set(cited_resolution) <= ids:
+            raise ValueError("Resolution requires a pending correction and supplied evidence IDs")
+        new_ids = set(cited_resolution) - set(pending.get("review_evidence_ids", []))
+        old_tool_results = set(pending.get("review_tool_digests", []))
+        if not any(e["id"] in new_ids and e["kind"] == "tool" and digest(e.get("text", "")) not in old_tool_results
+                   for e in payload["evidence"]):
+            raise ValueError("Resolution requires new primary tool proof of the correction")
     if decision.get("completed") and decision.get("intervene"):
         raise ValueError("Observer cannot declare completion while intervening")
     if decision.get("completed"):
@@ -784,6 +810,13 @@ def supersedes_pending_stop(decision, payload, pending):
     earlier_tool_results = set(pending.get("review_tool_digests", []))
     return any(e["id"] in new_citations and e["kind"] == "tool" and digest(e["text"]) not in earlier_tool_results
                for e in payload["evidence"])
+
+
+def review_evidence_signatures(state):
+    # A host can record the same message under another transport ID. New
+    # executor content invalidates the review. A mirror of reviewed text does not.
+    return {(entry["kind"], entry["text"]) for entry in state["evidence"]
+            if entry["kind"] in {"assistant", "action", "tool"}}
 
 
 @contextlib.contextmanager
@@ -958,6 +991,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             metrics = {}
             metrics_accounted = False
             decision = None
+            evidence_snapshot = review_evidence_signatures(state)
             state["model_calls"] += 1
             try:
                 decision, metrics = reviewer(cfg, payload)
@@ -970,7 +1004,6 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 state["billing_basis"] = metrics.get("billing_basis", "provider-reported dollar cost")
                 metrics_accounted = True
                 decision, deferred_closure = guard_review_phase(decision, payload)
-                validate_decision(decision, payload)
                 human_revision = state.get("human_revision", 0)
                 # A host may accept new owner input while a review is in flight.
                 # Never apply an older directive over newer human steering.
@@ -980,11 +1013,17 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     state["last_review"] = {"at": time.time(), **metrics, "discarded": "native owner interruption"}
                     atomic_save(state_path, state)
                     return {}, state
+                stale_reason = None
                 if state.get("human_revision", 0) != human_revision:
-                    state["status"] = "new owner input arrived; older review discarded"
-                    state["last_review"] = {"at": time.time(), **metrics, "discarded": "newer human input"}
+                    stale_reason = "newer human input"
+                elif state.get("source_error") or review_evidence_signatures(state) - evidence_snapshot:
+                    stale_reason = "changed executor evidence"
+                if stale_reason:
+                    state["status"] = stale_reason + "; older review discarded"
+                    state["last_review"] = {"at": time.time(), **metrics, "discarded": stale_reason}
                     atomic_save(state_path, state)
                     return {}, state
+                validate_decision(decision, payload)
                 state["last_review"] = {"at": time.time(), **metrics, "review_phase": payload["review_phase"], "decision": decision}
                 if deferred_closure:
                     state["last_review"]["deferred_model_verdict"] = deferred_closure

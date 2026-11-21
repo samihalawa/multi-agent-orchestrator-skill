@@ -95,6 +95,31 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(state["last_review"]["discarded"], "newer human input")
         self.assertAlmostEqual(state["cost_usd"], 0.0001)
 
+    def test_new_executor_result_invalidates_obsolete_stop_correction(self):
+        transcript = self.root / "advancing.jsonl"
+        transcript.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "user_message", "message": "Verify the published payload"}}) + "\n")
+        self.run_event(self.event("SessionStart", transcript_path=str(transcript)))
+
+        def outdated(cfg, payload):
+            self.assertEqual(payload["review_focus"]["latest_owner_instruction_id"], payload["intent"][-1]["id"])
+            self.assertEqual(payload["review_focus"]["executor_message_id"], payload["evidence"][-1]["id"])
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "function_call_output", "call_id": "new-readback",
+                    "output": "Published payload now retrieved and checksum matches"}}) + "\n")
+            return {"intervene": True, "reason": "The payload has not been read.",
+                    "next_action": "Retrieve the published payload.", "proof_needed": "Matching checksum.",
+                    "evidence_ids": [payload["intent"][-1]["id"]]}, {"usage": {}}
+
+        output, state = self.run_event(self.event("Stop", last_assistant_message="Stopping after build."), outdated)
+        self.assertEqual(output, {})
+        self.assertEqual(state["last_review"]["discarded"], "changed executor evidence")
+        self.assertIsNone(state["pending"])
+        _, state = self.run_event(self.event("Stop", last_assistant_message="Checksum now matches."))
+        self.assertEqual(state["model_calls"], 2)
+        self.assertIn("e:new-readback:result", [e["id"] for e in self.calls[-1]["evidence"]])
+
     def test_subagent_never_spawns_recursive_model_review(self):
         transcript = self.root / "child.jsonl"
         transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": "contract-test", "thread_source": "subagent"}}) + "\n")
@@ -146,6 +171,13 @@ class GuardianContracts(unittest.TestCase):
             g.validate_decision({"intervene": False, "resolved": True, "resolution_evidence_ids": ["e:old"]}, payload)
         payload["evidence"].append({"id": "e:new", "kind": "tool"})
         g.validate_decision({"intervene": False, "resolved": True, "resolution_evidence_ids": ["e:new"]}, payload)
+        payload["pending_correction"]["review_tool_digests"] = [g.digest("same publication")]
+        payload["evidence"].extend([{"id": "e:mirror", "kind": "tool", "text": "same publication"},
+                                    {"id": "e:claim", "kind": "assistant", "text": "It is done"}])
+        for missing_proof in ("e:mirror", "e:claim"):
+            with self.assertRaises(ValueError):
+                g.validate_decision({"intervene": False, "resolved": True,
+                                     "resolution_evidence_ids": [missing_proof]}, payload)
 
     def test_unknown_evidence_id_cannot_trigger_correction(self):
         with self.assertRaises(ValueError):
