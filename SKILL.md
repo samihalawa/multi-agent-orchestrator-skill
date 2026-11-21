@@ -200,6 +200,7 @@ can directly inspect a proposed stop and remain dormant between task events.
 Respect existing human pauses and keep unrelated jobs disabled.
 
 Use `python3 scripts/intent_guardian.py --help` for the current command contract.
+Guardian 1.3 loads local rules from `~/.config/intent-guardian/learned-patterns.json`, preserves citable inventory excerpts independently of the rolling evidence, and reviews a distinct `PostToolUseFailure` immediately when the host emits it. Use `audit --transcript … --session-id … --event Stop --through-line …` to replay a historical checkpoint without modifying the live cursor. Repeat `--focus-line` to restrict tool and assistant evidence to explicitly cited source lines while retaining the preceding human chronology. Keep the local learned file and its source samples out of the published skill.
 Cowork and GrokBot controllers can submit a genuine result once through
 `review-job --host cowork|grokbot` on the same executable. Pass the original
 request, stable session ID, executor result and exact native tool evidence.

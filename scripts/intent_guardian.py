@@ -23,10 +23,11 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.12"
+VERSION = "1.3.0"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
+LEARNED_PATTERNS = DEFAULT_CONFIG.with_name("learned-patterns.json")
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
 OBSERVE_EVENTS = {"SessionStart", "UserPromptSubmit", "PostCompact", "Interrupt", "SessionEnd"}
 REVIEW_EVENTS = {"Stop", "PreToolUse", "PostToolUse", "PostToolUseFailure"}
@@ -137,6 +138,8 @@ def bounded(text, limit):
 
 def redact(text):
     # Avoid transporting incidental credentials from tool output into the audit.
+    text = re.sub(r"(https?://[^\s?\"'\\]+)\?[^\s\"'\\]*(?:x-amz-signature|x-amz-credential|signature=|access_token=|api[_-]?key=)[^\s\"'\\]*",
+                  r"\1?[credential-query]", str(text), flags=re.I)
     text = re.sub(r"\b(?:sk-or-v1-|sk-proj-|ghp_|ctx7sk-)[A-Za-z0-9_-]+", "[credential]", str(text))
     text = re.sub(r"\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[credential]", text)
     return re.sub(r"(?im)(\b(?:authorization|api[_-]?key|password|secret|access_token|refresh_token)\s*[:=]\s*)[^\s,;\"}]+", r"\1[credential]", text)
@@ -274,7 +277,57 @@ def initial_state(session_id, host):
     return {"version": VERSION, "session_id": session_id, "host": host, "offset": 0,
             "line": 0, "evidence": [], "intent": [], "state_delta": "", "events": [],
             "events_since_review": 0, "model_calls": 0, "cost_usd": 0.0,
-            "pending": None, "completed": False, "malformed_lines": 0}
+            "pending": None, "completed": False, "malformed_lines": 0, "pinned_inventories": {}}
+
+
+INVENTORY_PATTERN = re.compile(
+    r'(?i)\b(?:\d[\d,.]*\s+(?:of|out of)\s+\d[\d,.]*|\d+\s*/\s*\d+|'
+    r'(?:inventory|population|discovered|matched|total|count|remaining|missing|'
+    r'records|pages|attachments|transcripts|archived|processed|fichas|con_texto)\b[^.\n]{0,35}?["\x27]?\s*[=:]\s*["\[]?\s*\d+|'
+    r'\d+\s+(?:records|pages|entries|attachments|transcripts|items|sessions|rows)\b)'
+)
+
+
+def pin_inventory(state, text, source_id):
+    """Retain compact discovery/count evidence independently of the rolling tail."""
+    excerpts = []
+    for line in text.replace('\\"', '"').splitlines():
+        match = INVENTORY_PATTERN.search(line)
+        if match:
+            excerpt = line[max(0, match.start() - 100):match.start() + 220].strip()
+            if excerpt not in excerpts:
+                excerpts.append(excerpt)
+            if len(excerpts) == 8:
+                break
+    if excerpts:
+        summary = "\n".join(excerpts)
+        state.setdefault("pinned_inventories", {}).setdefault(
+            digest(summary), {"id": source_id, "kind": "tool", "text": summary}
+        )
+
+
+def backfill_inventories(state, host):
+    """Recover pinned totals from the already-read prefix of a pre-1.3 session."""
+    path_text = state.get("transcript_path")
+    if not path_text or not state.get("offset"):
+        return
+    try:
+        with Path(path_text).expanduser().open("rb") as stream:
+            for line_number in range(1, state["line"] + 1):
+                if stream.tell() >= state["offset"]:
+                    break
+                raw = stream.readline()
+                if not raw:
+                    break
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                for kind, text, source_id in records(row, host, line_number):
+                    if kind == "tool":
+                        pin_inventory(state, redact(text), "e:" + str(source_id))
+    except OSError:
+        state["earlier_evidence_in_transcript"] = True
 
 
 def add_evidence(state, kind, text, source_id):
@@ -289,6 +342,8 @@ def add_evidence(state, kind, text, source_id):
         if any(e["kind"] in {"user", "task_request"} and e["text"] == text for e in state["intent"]):
             return
     source_id = "e:" + str(source_id)
+    if kind == "tool":
+        pin_inventory(state, text, source_id)
     if any(e["id"] == source_id and e["kind"] == kind for e in state["evidence"] + state["intent"]):
         return
     # Human corrections are never silently clipped or evicted before a review.
@@ -358,10 +413,13 @@ def ingest(state, event, host):
                 captured = [e for e in state["intent"] if digest(e["text"]) == pending_hash]
                 state["offset"], state["line"] = 0, 0
                 state["evidence"], state["intent"] = list(captured), list(captured)
+                state["pinned_inventories"] = {}
                 state["file_identity"] = identity
             with path.open("rb") as stream:
                 stream.seek(state["offset"])
                 while True:
+                    if state.get("audit_through_line") is not None and state["line"] >= state["audit_through_line"]:
+                        break
                     before = stream.tell()
                     raw = stream.readline()
                     if not raw:
@@ -404,6 +462,12 @@ def ingest(state, event, host):
                             state["last_transport_record"] = {"signature": signature, "transport": transport}
                             continue
                         add_evidence(state, kind, text, sid)
+                        if state["line"] in state.get("audit_focus_lines", []):
+                            state.setdefault("audit_focus_evidence", []).append(
+                                {"id": "e:line:" + str(state["line"]) + ":" + kind,
+                                 "source_id": "e:" + str(sid), "kind": kind,
+                                 "text": bounded(redact(text), 3600), "line": state["line"]}
+                            )
                         state["last_transport_record"] = {"signature": signature, "transport": transport}
                 state["offset"] = stream.tell()
             state.pop("source_error", None)
@@ -514,7 +578,13 @@ def api_key(cfg):
 
 
 def review_payload(state, event):
-    evidence = state["evidence"]
+    recent = state["evidence"]
+    pinned = state.get("pinned_inventories", {})
+    recent_ids = {entry["id"] for entry in recent}
+    evidence = [entry for entry in pinned.values() if entry["id"] not in recent_ids] + recent
+    if state.get("audit_focus_lines"):
+        evidence = list({entry["id"]: entry for entry in state.get("audit_focus_evidence", [])
+                         if entry["kind"] != "runtime_feedback"}.values())
     # Every record retains its source identity; omitted earlier evidence is
     # explicit. State delta is never promoted to current provider proof.
     name = event.get("hook_event_name")
@@ -546,7 +616,8 @@ def review_payload(state, event):
             "intent": state["intent"], "prior_state_delta": state["state_delta"],
             "pending_correction": state.get("pending"), "evidence": evidence,
             "coverage": {"transcript_lines_parsed": state["line"], "malformed": state["malformed_lines"],
-                         "recent_evidence_records": len(evidence), "bounded_recent_evidence": True,
+                         "recent_evidence_records": len(recent), "pinned_inventory_records": len(pinned), "bounded_recent_evidence": True,
+                         "explicit_audit_focus_lines": state.get("audit_focus_lines"),
                          "older_intent_in_delta_or_transcript": state.get("older_intent_in_delta_or_transcript", False),
                          "earlier_evidence_in_transcript": state.get("earlier_evidence_in_transcript", False),
                          "uncompressed_human_messages": len(state["intent"]),
@@ -568,6 +639,19 @@ def parse_model_json(text):
 def policy_text(payload=None):
     policy_file = ROOT / "references/guardian-policy.md"
     policy = POLICY + ("\n" + policy_file.read_text() if policy_file.is_file() else "")
+    try:
+        learned = json.loads(LEARNED_PATTERNS.read_text())
+    except (OSError, ValueError):
+        learned = {}
+    rows = learned.get("patterns", []) if isinstance(learned, dict) else []
+    if isinstance(rows, list):
+        hints = ["- " + redact(bounded(row["rule"], 360)) for row in rows[:30]
+                 if isinstance(row, dict) and isinstance(row.get("rule"), str)]
+        if hints:
+            policy += "\nLocal learned rules are diagnostic hints, subject to current intent and evidence.\n" + "\n".join(hints)
+    if payload and payload.get("coverage", {}).get("explicit_audit_focus_lines"):
+        policy += ("\nHistorical evidence IDs beginning with e:line: are valid citations. Copy the complete id field exactly, "
+                   "including the final kind. Compare separately the required record content and the existence of the record or archive.")
     if payload is not None and payload.get("event") != "Stop":
         policy += """\nPHASE ISOLATION — ACTIVE TASK CHECKPOINT, NOT FINAL CLOSURE.
 For this invocation review ONLY a presently evidenced route/scope contradiction,
@@ -908,6 +992,9 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["version"] = VERSION
             state.pop("reviewed_hash", None)
             state.pop("failed_hash", None)
+            if "pinned_inventories" not in state:
+                state["pinned_inventories"] = {}
+                backfill_inventories(state, host)
             misattributed = [entry for entry in state["intent"] if classify_prompt(entry["text"])[0] == "runtime_feedback"]
             if misattributed:
                 ids = {entry["id"] for entry in misattributed}
@@ -935,6 +1022,9 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     state["scope_recovered_by_reparse"] = True
                 else:
                     state["scope_gap"] = {"cause": "Earlier engine evicted unreviewed human corrections; original transcript is absent", "source": None}
+        if event.get("_audit_through_line") is not None:
+            state["audit_through_line"] = event["_audit_through_line"]
+            state["audit_focus_lines"] = event.get("_audit_focus_lines", [])
         state["last_event"], state["last_seen"] = name, time.time()
         revision_before_event = state.get("human_revision", 0)
         if state.get("pending"):
@@ -956,8 +1046,12 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             state["events_since_review"] += 1
         payload = review_payload(state, event)
         hash_fields = {key: payload[key] for key in ("review_phase", "intent", "evidence", "native_background_tasks")}
+        if name == "PostToolUseFailure":
+            failure = redact(flatten(event.get("error", event.get("tool_response", event.get("tool_result", "")))))
+            hash_fields["failed_route"] = digest([event.get("tool_name"), event.get("tool_input"), failure, state.get("human_revision", 0)])
         content_hash = digest(hash_fields)
-        due = force or name == "Stop" or name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"} and state["events_since_review"] >= int(cfg["checkpoint_every"])
+        due = (force or name in {"Stop", "PostToolUseFailure"}
+               or name in {"PreToolUse", "PostToolUse"} and state["events_since_review"] >= int(cfg["checkpoint_every"]))
         why = "observed"
         if state.get("subagent") or os.environ.get("INTENT_GUARDIAN_OBSERVER") == "1":
             due, why = False, "observer/subagent recursion excluded"
@@ -969,7 +1063,9 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             due, why = False, "exact human scope gap retained; no judgment issued"
         elif state.get("source_error"):
             due, why = False, "source unavailable; no unsupported judgment issued"
-        elif content_hash == state.get("reviewed_hash"):
+        elif content_hash == state.get("reviewed_hash") or (
+            name == "PostToolUseFailure" and content_hash in state.get("reviewed_failure_hashes", [])
+        ):
             due, why = False, "unchanged evidence; no duplicate model call"
         elif content_hash == state.get("failed_hash") and not state.get("backend_cooldown") and time.time() - state.get("failure_at", 0) < 300:
             due, why = False, "unchanged failed audit; waiting for new evidence or retry window"
@@ -1031,7 +1127,11 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 state["events_since_review"] = 0
                 state["state_delta"] = redact(bounded(decision.get("state_delta", ""), 1800))
                 compact_reviewed_intent(state, decision)
-                state["reviewed_hash"] = digest({**hash_fields, "intent": state["intent"], "evidence": state["evidence"]})
+                refreshed = review_payload(state, event)
+                state["reviewed_hash"] = digest({**hash_fields, "intent": refreshed["intent"], "evidence": refreshed["evidence"]})
+                if name == "PostToolUseFailure":
+                    failures = state.get("reviewed_failure_hashes", [])
+                    state["reviewed_failure_hashes"] = (failures + [content_hash, state["reviewed_hash"]])[-64:]
                 state.pop("model_error", None)
                 if decision.get("resolved"):
                     state["last_resolution"] = {"at": time.time(), "evidence_ids": decision.get("resolution_evidence_ids"), "correction": state.get("pending")}
@@ -1171,6 +1271,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--session-id")
     parser.add_argument("--transcript", type=Path)
+    parser.add_argument("--through-line", type=int, help="Audit a transcript prefix through this physical JSONL line")
+    parser.add_argument("--focus-line", type=int, action="append", default=[],
+                        help="Citable evidence line for an isolated historical audit; repeat as needed")
     parser.add_argument("--event", default="Stop", choices=sorted(OBSERVE_EVENTS | REVIEW_EVENTS))
     args = parser.parse_args(argv)
     if args.command == "health":
@@ -1203,6 +1306,15 @@ def main(argv=None):
             if not args.transcript or not args.session_id:
                 parser.error("audit requires --transcript and --session-id")
             event = {"session_id": args.session_id, "transcript_path": str(args.transcript), "hook_event_name": args.event}
+            if args.through_line is not None:
+                if args.through_line < 1:
+                    parser.error("--through-line must be positive")
+                event["_audit_through_line"] = args.through_line
+                if any(line < 1 or line > args.through_line for line in args.focus_line):
+                    parser.error("--focus-line must be inside the audited prefix")
+                event["_audit_focus_lines"] = args.focus_line
+            elif args.focus_line:
+                parser.error("--focus-line requires --through-line")
         else:
             event = json.load(sys.stdin)
             if not isinstance(event, dict):
@@ -1220,11 +1332,19 @@ def main(argv=None):
                      "_controller_job": {"prompt": prompt, "evidence": proofs, "delivery": event.get("delivery")}}
         elif args.command == "hook":
             event.pop("_controller_job", None)
-        output, state = process_event(event, args.host, cfg, args.state_dir, force=args.command == "audit")
+            event.pop("_audit_through_line", None)
+            event.pop("_audit_focus_lines", None)
+        if args.command == "audit" and args.through_line is not None:
+            # A historical replay must neither reuse nor overwrite a live session cursor.
+            with tempfile.TemporaryDirectory(prefix="guardian-checkpoint-") as isolated:
+                output, state = process_event(event, args.host, cfg, Path(isolated), force=True)
+        else:
+            output, state = process_event(event, args.host, cfg, args.state_dir, force=args.command == "audit")
         if args.command == "review-job" or (args.command == "hook" and state.get("last_event") in {"SessionStart", "Stop"}):
             publish_feed(cfg, state)
         if args.command in {"audit", "review-job"}:
-            print(json.dumps({"hook_output": output, "status": state.get("status"), "last_review": state.get("last_review"), "pending": state.get("pending"), "last_resolution": state.get("last_resolution"), "model_error": state.get("model_error")}, ensure_ascii=False))
+            print(json.dumps({"hook_output": output, "status": state.get("status"), "last_review": state.get("last_review"), "pending": state.get("pending"), "last_resolution": state.get("last_resolution"), "model_error": state.get("model_error"),
+                              "transcript_lines_parsed": state.get("line"), "pinned_inventory_records": len(state.get("pinned_inventories", {}))}, ensure_ascii=False))
         else:
             print(json.dumps(output, ensure_ascii=False))
         return 0
