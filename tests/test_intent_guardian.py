@@ -584,6 +584,19 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(g.redact("receipt SUB-1234"), "receipt SUB-1234")
         self.assertNotIn("abcdef", g.redact("sk-or-v1-abcdef"))
 
+    def test_controller_review_reuses_same_intent_and_publishes_no_raw_evidence(self):
+        event = self.event("Stop", last_assistant_message="The source was read.",
+                           _controller_job={"prompt": "Verify the real release",
+                                            "evidence": ["Read the actual source; secret=foo"]})
+        a, first = g.process_event(event, "grokbot", self.cfg, self.root, self.reviewer)
+        b, second = g.process_event(event, "grokbot", self.cfg, self.root, self.reviewer)
+        self.assertEqual(a, b)
+        self.assertEqual(len(second["intent"]), 1)
+        self.assertEqual(second["model_calls"], 1)
+        self.assertEqual(self.calls[0]["review_phase"], "closure")
+        self.assertEqual(g.feed_events(first)[0]["host"], "grokbot")
+        self.assertNotIn("actual source", json.dumps(g.feed_events(first)))
+
     def test_backend_cooldown_spans_hosts_and_recovers_with_one_probe(self):
         self.run_event(self.event("UserPromptSubmit", prompt="Check the requested record"))
 

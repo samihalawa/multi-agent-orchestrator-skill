@@ -200,6 +200,14 @@ can directly inspect a proposed stop and remain dormant between task events.
 Respect existing human pauses and keep unrelated jobs disabled.
 
 Use `python3 scripts/intent_guardian.py --help` for the current command contract.
+Cowork and GrokBot controllers can submit a genuine result once through
+`review-job --host cowork|grokbot` on the same executable. Pass the original
+request, stable session ID, executor result and exact native tool evidence.
+A controller must only acknowledge delivery after it reads the correction back
+from the receiving host. A controller review is distinct from a native hook.
+An optional `feed_url` and `feed_token_file` publish bounded status and tagged
+correction events to the read-only dashboard at starts and stops. Keep the token
+outside the skill and the raw transcripts on the producing host.
 Configure its decision model in `~/.config/intent-guardian/config.json`. The
 `codex_subscription` backend uses an existing native Codex login through a
 documented child-only `native_home` with an `auth.json` symlink to the canonical

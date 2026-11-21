@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.9"
+VERSION = "1.2.10"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -183,7 +183,7 @@ def runtime_task_request(payload):
 def records(row, host, line_number):
     """Extract public task data only; no hidden reasoning or injected instructions."""
     source_id = str(row.get("uuid") or row.get("ordinal") or line_number)
-    if host == "claude":
+    if host in {"claude", "cowork"}:
         if row.get("isSidechain"):
             return []
         typ = row.get("type")
@@ -319,6 +319,21 @@ def compact_reviewed_intent(state, decision):
 
 def ingest(state, event, host):
     revision_before_read = state.get("human_revision", 0)
+    job = event.get("_controller_job")
+    if job:
+        prompt = job["prompt"]
+        prompt_hash = digest(prompt)
+        if prompt_hash != state.get("controller_prompt_hash"):
+            state["controller_prompt_hash"] = prompt_hash
+            add_evidence(state, "user", prompt, "job-prompt:" + prompt_hash[:16])
+        for result in job["evidence"]:
+            add_evidence(state, "tool", result, "job-proof:" + digest(result)[:16])
+        receipt = job.get("delivery")
+        if isinstance(receipt, dict) and isinstance(receipt.get("source_id"), str):
+            correction = state.get("corrections", {}).get(receipt.get("correction_hash"))
+            if correction is not None and receipt["source_id"].strip():
+                correction.setdefault("delivery", {"source_id": bounded(redact(receipt["source_id"]), 160),
+                                                   "at": time.time()})
     path_text = event.get("transcript_path") or state.get("transcript_path")
     if path_text:
         path = Path(path_text).expanduser()
@@ -1002,7 +1017,8 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                         previous = corrections.get((pending or {}).get("feedback_hash"))
                         if previous is not None:
                             previous["outcome"] = {"status": "superseded", "at": time.time(), "replacement": feedback_hash}
-                        corrections[feedback_hash] = {"emitted_at": time.time(), "event": name, "outcome": {"status": "pending"}}
+                        corrections[feedback_hash] = {"emitted_at": time.time(), "event": name,
+                                                      "message": redact(feedback), "outcome": {"status": "pending"}}
                         state["last_correction_hash"] = correction_hash
                         state["pending"] = {"verdict_domain": decision["verdict_domain"], "reason": bounded(decision["reason"], 650), "next_action": bounded(decision["next_action"], 900), "proof_needed": bounded(decision["proof_needed"], 650), "evidence_ids": decision["evidence_ids"], "review_evidence_ids": [e["id"] for e in payload["evidence"]], "human_revision": current_revision, "at": time.time()}
                         state["pending"]["review_tool_digests"] = [digest(e["text"]) for e in payload["evidence"] if e["kind"] == "tool"]
@@ -1056,10 +1072,59 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         return output, state
 
 
+def feed_events(state):
+    seen = state.get("last_seen")
+    if not seen or not state.get("session_id"):
+        return []
+    host, session = state["host"], state["session_id"]
+    # Keep the dashboard independent of local paths and transcript contents.
+    def item(kind, identity, at, **details):
+        return {"id": digest([host, session, kind, identity]), "host": host,
+                "session_id": session, "kind": kind, "at": at, **details}
+    events = [item("seen", "latest", seen)]
+    if state.get("model_error") or state.get("backend_cooldown"):
+        error = state.get("model_error") or state["backend_cooldown"]
+        category = error.get("category", "review_error")
+        events.append(item("error", [category, error.get("at") or error.get("failed_at")], seen, message=category))
+    for key, correction in list(state.get("corrections", {}).items())[-6:]:
+        message = correction.get("message")
+        detail = {"message": bounded(redact(message), 2400)} if message else {}
+        outcome = correction["outcome"]
+        events.append(item("correction", key, correction["emitted_at"], outcome=outcome["status"], **detail))
+        delivery = correction.get("delivery")
+        if delivery:
+            events.append(item("delivered", key, delivery.get("at", correction["emitted_at"]), **detail))
+        if outcome["status"] != "pending":
+            events.append(item("outcome", key, outcome["at"], outcome=outcome["status"], **detail))
+    return events
+
+
+def publish_feed(cfg, state):
+    url = cfg.get("feed_url")
+    token = os.environ.get("GUARDIAN_FEED_TOKEN")
+    if not token and cfg.get("feed_token_file"):
+        try:
+            token = Path(cfg["feed_token_file"]).expanduser().read_text().strip()
+        except OSError:
+            return False
+    if not url or not token or not url.startswith("https://"):
+        return False
+    events = feed_events(state)
+    if not events:
+        return False
+    request = urllib.request.Request(url, data=json.dumps(events).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=0.8) as response:
+            return 200 <= response.status < 300
+    except (OSError, ValueError):
+        return False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["hook", "audit", "status", "health"])
-    parser.add_argument("--host", choices=["codex", "claude"], default="codex")
+    parser.add_argument("command", choices=["hook", "audit", "review-job", "sync-feed", "status", "health"])
+    parser.add_argument("--host", choices=["codex", "claude", "cowork", "grokbot"], default="codex")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--session-id")
@@ -1085,6 +1150,13 @@ def main(argv=None):
         return 0
     try:
         cfg = load_config(args.config)
+        if args.command == "sync-feed":
+            if not args.session_id:
+                parser.error("sync-feed requires --session-id")
+            key = digest([args.host, args.session_id])[:32]
+            file = args.state_dir / (key + ".json")
+            print(json.dumps({"published": file.is_file() and publish_feed(cfg, json.loads(file.read_text()))}))
+            return 0
         if args.command == "audit":
             if not args.transcript or not args.session_id:
                 parser.error("audit requires --transcript and --session-id")
@@ -1093,8 +1165,23 @@ def main(argv=None):
             event = json.load(sys.stdin)
             if not isinstance(event, dict):
                 raise ValueError("hook input must be an object")
+        if args.command == "review-job":
+            sid, prompt = event.get("session_id"), event.get("prompt")
+            proofs, result = event.get("evidence", []), event.get("result")
+            if not isinstance(sid, str) or not sid.strip() or len(sid) > 200:
+                raise ValueError("Job review requires a valid session identifier")
+            if not isinstance(prompt, str) or not prompt.strip() or not isinstance(result, str) or not result.strip():
+                raise ValueError("Job review requires actual intent and an executor result")
+            if not isinstance(proofs, list) or len(proofs) > 12 or not all(isinstance(p, str) for p in proofs):
+                raise ValueError("Job review evidence must be a short list of primary tool results")
+            event = {"session_id": sid, "hook_event_name": "Stop", "last_assistant_message": result,
+                     "_controller_job": {"prompt": prompt, "evidence": proofs, "delivery": event.get("delivery")}}
+        elif args.command == "hook":
+            event.pop("_controller_job", None)
         output, state = process_event(event, args.host, cfg, args.state_dir, force=args.command == "audit")
-        if args.command == "audit":
+        if args.command == "review-job" or (args.command == "hook" and state.get("last_event") in {"SessionStart", "Stop"}):
+            publish_feed(cfg, state)
+        if args.command in {"audit", "review-job"}:
             print(json.dumps({"hook_output": output, "status": state.get("status"), "last_review": state.get("last_review"), "pending": state.get("pending"), "last_resolution": state.get("last_resolution"), "model_error": state.get("model_error")}, ensure_ascii=False))
         else:
             print(json.dumps(output, ensure_ascii=False))
