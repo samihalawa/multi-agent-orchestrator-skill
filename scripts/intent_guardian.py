@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.10"
+VERSION = "1.2.11"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -1100,6 +1100,8 @@ def feed_events(state):
 
 
 def publish_feed(cfg, state):
+    if state.get("subagent") or os.environ.get("INTENT_GUARDIAN_OBSERVER") == "1":
+        return False
     url = cfg.get("feed_url")
     token = os.environ.get("GUARDIAN_FEED_TOKEN")
     if not token and cfg.get("feed_token_file"):
@@ -1113,7 +1115,8 @@ def publish_feed(cfg, state):
     if not events:
         return False
     request = urllib.request.Request(url, data=json.dumps(events).encode(),
-                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                                              "User-Agent": "IntentGuardian/" + VERSION})
     try:
         with urllib.request.urlopen(request, timeout=0.8) as response:
             return 200 <= response.status < 300
