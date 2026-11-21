@@ -1,7 +1,12 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
+
 const hosts = ["codex", "claude", "cowork", "grokbot"];
 const kinds = ["seen", "correction", "delivered", "outcome", "error"];
 const labels = { codex: "Codex", claude: "Claude Code", cowork: "Cowork", grokbot: "GrokBot" };
-const encoder = new TextEncoder();
+const maxBodyLength = 80_000;
 
 function response(body, status = 200, headers = {}) {
   return new Response(body, {
@@ -17,12 +22,10 @@ function response(body, status = 200, headers = {}) {
   });
 }
 
-async function matches(provided, expected) {
+function matches(provided, expected) {
   if (!expected || !provided || provided.length > 1024) return false;
-  const [left, right] = await Promise.all(
-    [provided, expected].map((value) => crypto.subtle.digest("SHA-256", encoder.encode(value)))
-  );
-  return crypto.subtle.timingSafeEqual(left, right);
+  const digest = (value) => createHash("sha256").update(value).digest();
+  return timingSafeEqual(digest(provided), digest(expected));
 }
 
 function escape(text) {
@@ -39,7 +42,7 @@ function redact(message) {
     .replace(/\b((?:authorization|api[_-]?key|password|secret|access_token|refresh_token)\s*[:=]\s*)[^\s,;"}]+/gi, "$1[credential]");
 }
 
-function normalize(event) {
+function normalize(event, importing = false) {
   if (!event || typeof event.id !== "string" || !/^[\w:.-]{1,180}$/.test(event.id) ||
       typeof event.session_id !== "string" || !/^[\w:.-]{1,180}$/.test(event.session_id) ||
       !hosts.includes(event.host) || !kinds.includes(event.kind) ||
@@ -48,27 +51,48 @@ function normalize(event) {
   if (event.message != null && typeof event.message !== "string") return null;
   if (event.outcome != null && !["verified", "superseded", "pending"].includes(event.outcome)) return null;
   return [event.id, event.host, event.session_id, event.kind, event.at,
-    event.message ? redact(event.message).slice(0, 2600) : "", event.outcome ?? null];
+    importing ? event.message : redact(event.message ?? "").slice(0, 2600), event.outcome ?? null];
 }
 
-async function ingest(request, env) {
-  if (!await matches(request.headers.get("Authorization"), env.FEED_TOKEN ? "Bearer " + env.FEED_TOKEN : "")) {
+async function readBody(request) {
+  // UTF-8 uses at most three bytes per UTF-16 code unit. Retain the existing
+  // character limit while bounding memory for requests without Content-Length.
+  const maxBytes = maxBodyLength * 3;
+  if (Number(request.headers["content-length"]) > maxBytes) return null;
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) return null;
+    chunks.push(chunk);
+  }
+  const body = Buffer.concat(chunks, bytes).toString("utf8");
+  return body.length <= maxBodyLength ? body : null;
+}
+
+async function ingest(request, database, feedAuthorization) {
+  if (!matches(request.headers.authorization, feedAuthorization)) {
     return response("Unauthorized", 401);
   }
-  if (!/^application\/json\b/i.test(request.headers.get("Content-Type") || "")) {
+  if (!/^application\/json\b/i.test(request.headers["content-type"] || "")) {
     return response("Expected application/json", 415);
   }
-  const body = await request.text();
-  if (body.length > 80000) return response("Event batch is too large", 413);
+  const body = await readBody(request);
+  if (body === null) return response("Event batch is too large", 413);
   let events;
   try {
     const parsed = JSON.parse(body);
-    events = (Array.isArray(parsed) ? parsed : [parsed]).map(normalize);
+    events = (Array.isArray(parsed) ? parsed : [parsed]).map((event) => normalize(event));
   } catch {
     return response("Invalid JSON", 400);
   }
   if (!events.length || events.length > 20 || events.includes(null)) return response("Invalid events", 400);
-  const statement = env.DB.prepare(`
+  writeEvents(database, events);
+  return response(JSON.stringify({ accepted: events.length }), 200, { "Content-Type": "application/json" });
+}
+
+function writeEvents(database, events) {
+  const statement = database.prepare(`
     INSERT INTO events (id, host, session_id, kind, at, message, outcome)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
@@ -77,8 +101,14 @@ async function ingest(request, env) {
       AND excluded.session_id = events.session_id AND excluded.kind = events.kind
       AND (events.at <> excluded.at OR events.message <> excluded.message OR events.outcome IS NOT excluded.outcome)
   `);
-  await env.DB.batch(events.map((event) => statement.bind(...event)));
-  return response(JSON.stringify({ accepted: events.length }), 200, { "Content-Type": "application/json" });
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const event of events) statement.run(...event);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 const time = new Intl.DateTimeFormat("en-GB", {
@@ -89,17 +119,15 @@ function timestamp(value) {
   return time.format(new Date(value * 1000));
 }
 
-async function dashboard(env) {
-  const [events, heartbeat] = await Promise.all([
-    env.DB.prepare(`SELECT host, session_id, kind, at, message, outcome
-      FROM events WHERE kind <> 'seen' ORDER BY at DESC LIMIT 80`).all(),
-    env.DB.prepare("SELECT host, MAX(at) AS at FROM events GROUP BY host").all(),
-  ]);
-  const last = Object.fromEntries(heartbeat.results.map((row) => [row.host, row.at]));
+function dashboard(database) {
+  const events = database.prepare(`SELECT host, session_id, kind, at, message, outcome
+    FROM events WHERE kind <> 'seen' ORDER BY at DESC LIMIT 80`).all();
+  const heartbeat = database.prepare("SELECT host, MAX(at) AS at FROM events GROUP BY host").all();
+  const last = Object.fromEntries(heartbeat.map((row) => [row.host, row.at]));
   const cards = hosts.map((host) => `<div><strong>${labels[host]}</strong><span>${
     last[host] != null ? "Last seen " + timestamp(last[host]) : "No events yet"
   }</span></div>`).join("");
-  const rows = events.results.map((event) => `<li><div class="meta"><strong>${labels[event.host]}</strong>
+  const rows = events.map((event) => `<li><div class="meta"><strong>${labels[event.host]}</strong>
     <span>${escape(event.kind)}${event.outcome ? " · " + escape(event.outcome) : ""}</span><time>${timestamp(event.at)}</time></div>
     ${event.message && ["correction", "error"].includes(event.kind) ? "<p>" + escape(event.message) + "</p>" : ""}
     <small>Session ${escape(event.session_id)}</small></li>`).join("");
@@ -119,17 +147,57 @@ async function dashboard(env) {
     </main></body></html>`, 200, { "Content-Type": "text/html; charset=utf-8" });
 }
 
-export default {
-  async fetch(request, env) {
-    const route = new URL(request.url).pathname;
-    if (route === "/healthz" && request.method === "GET") return response("OK");
-    if (route === "/events" && request.method === "POST") return ingest(request, env);
+function serve(database, feedToken, readerPassword) {
+  const feedAuthorization = "Bearer " + feedToken;
+  const readerAuthorization = "Basic " + Buffer.from("sami:" + readerPassword).toString("base64");
+  async function handle(request) {
+    const route = new URL(request.url, "http://localhost").pathname;
+    if (route === "/healthz" && request.method === "GET") {
+      database.prepare("SELECT id FROM events LIMIT 1").get();
+      return response("OK");
+    }
+    if (route === "/events" && request.method === "POST") return ingest(request, database, feedAuthorization);
     if (route !== "/") return response("Not found", 404);
     if (request.method !== "GET") return response("Method not allowed", 405, { Allow: "GET" });
-    const expected = env.READER_PASSWORD ? "Basic " + btoa("sami:" + env.READER_PASSWORD) : "";
-    if (!await matches(request.headers.get("Authorization"), expected)) {
+    if (!matches(request.headers.authorization, readerAuthorization)) {
       return response("Private dashboard", 401, { "WWW-Authenticate": 'Basic realm="Intent Guardian", charset="UTF-8"' });
     }
-    return dashboard(env);
-  },
-};
+    return dashboard(database);
+  }
+  const server = createServer({ requestTimeout: 15_000, headersTimeout: 10_000 }, async (incoming, outgoing) => {
+    let result;
+    try {
+      result = await handle(incoming);
+    } catch (error) {
+      if (outgoing.destroyed) return;
+      console.error("Dashboard request failed", error.code ?? error.name);
+      result = response("Server error", 500);
+    }
+    const headers = Object.fromEntries(result.headers);
+    if (!incoming.readableEnded && (incoming.headers["content-length"] || incoming.headers["transfer-encoding"])) {
+      headers.connection = "close";
+    }
+    outgoing.writeHead(result.status, headers);
+    outgoing.end(Buffer.from(await result.arrayBuffer()));
+  });
+  server.listen(Number(process.env.PORT ?? 8080), "0.0.0.0");
+  process.once("SIGTERM", () => server.close(() => database.close()));
+}
+
+const database = new DatabaseSync(process.env.GUARDIAN_DB_PATH ?? "/data/guardian.sqlite");
+database.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
+database.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
+if (process.argv[2] === "--import-events") {
+  const rows = JSON.parse(readFileSync(0, "utf8"));
+  if (!Array.isArray(rows)) throw new Error("Expected a JSON array of D1 events");
+  const events = rows.map((row) => (typeof row?.message === "string" ? normalize(row, true) : null));
+  if (events.includes(null)) throw new Error("Invalid D1 event row");
+  writeEvents(database, events);
+  const total = database.prepare("SELECT COUNT(*) AS total FROM events").get().total;
+  console.log(JSON.stringify({ processed: events.length, total }));
+  database.close();
+} else {
+  const { FEED_TOKEN, READER_PASSWORD } = process.env;
+  if (!FEED_TOKEN || !READER_PASSWORD) throw new Error("FEED_TOKEN and READER_PASSWORD must be configured");
+  serve(database, FEED_TOKEN, READER_PASSWORD);
+}
