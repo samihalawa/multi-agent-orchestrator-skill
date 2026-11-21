@@ -802,6 +802,53 @@ def call_native_model(cfg, payload):
     return decision, metrics
 
 
+def in_record_omission(payload):
+    """Recognize a high-confidence archive omission without relying on a remote reviewer."""
+    if payload.get("event") != "Stop" or payload.get("coverage", {}).get("scope_gap"):
+        return None
+    intent = payload["intent"]
+    if not intent:
+        return None
+    latest = intent[-1]["text"]
+    if re.search(r"\b(?:read.only|report only|audit only|audio only|without transcripts|"
+                 r"solo (?:audita|informe|audios?)|sin transcripciones|"
+                 r"no (?:edites|escribas|modifiques|transcribas))\b", latest, re.I):
+        return None
+    if not re.search(r"\b(?:notion|audio|recordings?|grabaciones|transcri\w+)\b", latest, re.I):
+        return None
+    target = next((e for e in reversed(intent) if re.search(r"\bnotion\b", e["text"], re.I)
+                   and re.search(r"\b(?:add|populate|hydrate|import|añade|agrega)\b", e["text"], re.I)
+                   and re.search(r"\btranscri\w+", e["text"], re.I)), None)
+    if not target:
+        return None
+    evidence = payload["evidence"]
+    inventory = next((e for e in reversed(evidence) if e["kind"] == "tool"
+                      and re.search(r"\b(?:transcripts|transcripciones)\s+[1-9][\d,.]*\b", e["text"], re.I)), None)
+    missing = next((e for e in reversed(evidence) if e["kind"] == "tool"
+                    and re.search(r"\b(?:sin transcripci[oó]n localizada|missing transcript)\b", e["text"], re.I)), None)
+    closeout = next((e for e in reversed(evidence) if e["kind"] == "assistant"
+                     and e["id"] == payload["review_focus"].get("executor_message_id")), None)
+    if not inventory or not missing or not closeout:
+        return None
+    if not (re.search(r"\b(?:fichas|records|pages)\b", closeout["text"], re.I)
+            and re.search(r"\bnotion(?:\.com|\.so)?\b", closeout["text"], re.I)):
+        return None
+    if re.search(r"\b(?:transcri\w+|hydrat\w+)\b", closeout["text"], re.I):
+        # A closeout that does discuss transcript coverage needs semantic review.
+        return None
+    return {
+        "intervene": True,
+        "verdict_domain": "closure",
+        "reason": "The Notion closeout counts recording records, but available transcripts and evidence of missing transcript content remain unreconciled.",
+        "next_action": "Match available transcripts to their existing Notion recording pages and hydrate the missing transcript bodies in those pages. Keep any sidecar archive as a separate artifact.",
+        "proof_needed": "Open the updated Notion pages and verify the transcript text in-page. Reconcile eligible, populated, unmatched, and unavailable transcript counts.",
+        "evidence_ids": list(dict.fromkeys(e["id"] for e in (target, inventory, missing, closeout))),
+        "resolved": False, "resolution_evidence_ids": [], "completed": False,
+        "state_delta": "Notion recording catalog and in-page transcript coverage require separate proof. Reconcile available transcript sources to existing recording pages.",
+        "summarized_intent_ids": [],
+    }
+
+
 def call_model(cfg, payload):
     if cfg.get("backend") == "codex_subscription":
         return call_native_model(cfg, payload)
@@ -1090,7 +1137,15 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
             evidence_snapshot = review_evidence_signatures(state)
             state["model_calls"] += 1
             try:
-                decision, metrics = reviewer(cfg, payload)
+                local_decision = in_record_omission(payload) if reviewer is call_model else None
+                if local_decision is not None:
+                    decision, metrics = local_decision, {
+                        "backend": "local_evidence_rule", "usage": {"cost": 0},
+                        "billing_basis": "Local evidence rule; no model request",
+                    }
+                    state["model_calls"] -= 1
+                else:
+                    decision, metrics = reviewer(cfg, payload)
                 backend_gate(gate, timeout, started=started)
                 record_review_usage(state, metrics)
                 state["cost_usd"] += float(metrics.get("usage", {}).get("cost") or 0)
