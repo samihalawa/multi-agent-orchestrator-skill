@@ -48,7 +48,7 @@ function normalize(event) {
   if (event.message != null && typeof event.message !== "string") return null;
   if (event.outcome != null && !["verified", "superseded", "pending"].includes(event.outcome)) return null;
   return [event.id, event.host, event.session_id, event.kind, event.at,
-    event.message ? redact(event.message).slice(0, 1500) : "", event.outcome ?? null];
+    event.message ? redact(event.message).slice(0, 2600) : "", event.outcome ?? null];
 }
 
 async function ingest(request, env) {
@@ -59,7 +59,7 @@ async function ingest(request, env) {
     return response("Expected application/json", 415);
   }
   const body = await request.text();
-  if (body.length > 48000) return response("Event batch is too large", 413);
+  if (body.length > 80000) return response("Event batch is too large", 413);
   let events;
   try {
     const parsed = JSON.parse(body);
@@ -69,8 +69,13 @@ async function ingest(request, env) {
   }
   if (!events.length || events.length > 20 || events.includes(null)) return response("Invalid events", 400);
   const statement = env.DB.prepare(`
-    INSERT OR IGNORE INTO events (id, host, session_id, kind, at, message, outcome)
+    INSERT INTO events (id, host, session_id, kind, at, message, outcome)
     VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      at = excluded.at, message = excluded.message, outcome = excluded.outcome
+    WHERE excluded.at >= events.at AND excluded.host = events.host
+      AND excluded.session_id = events.session_id AND excluded.kind = events.kind
+      AND (events.at <> excluded.at OR events.message <> excluded.message OR events.outcome IS NOT excluded.outcome)
   `);
   await env.DB.batch(events.map((event) => statement.bind(...event)));
   return response(JSON.stringify({ accepted: events.length }), 200, { "Content-Type": "application/json" });
@@ -95,8 +100,8 @@ async function dashboard(env) {
     last[host] != null ? "Last seen " + timestamp(last[host]) : "No events yet"
   }</span></div>`).join("");
   const rows = events.results.map((event) => `<li><div class="meta"><strong>${labels[event.host]}</strong>
-    <span>${escape(event.outcome || event.kind)}</span><time>${timestamp(event.at)}</time></div>
-    ${event.message ? "<p>" + escape(event.message) + "</p>" : ""}
+    <span>${escape(event.kind)}${event.outcome ? " · " + escape(event.outcome) : ""}</span><time>${timestamp(event.at)}</time></div>
+    ${event.message && ["correction", "error"].includes(event.kind) ? "<p>" + escape(event.message) + "</p>" : ""}
     <small>Session ${escape(event.session_id)}</small></li>`).join("");
   return response(`<!doctype html><html lang="en"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
