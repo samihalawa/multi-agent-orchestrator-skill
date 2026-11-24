@@ -11,3 +11,9 @@ CREATE TABLE IF NOT EXISTS events (
   session_state TEXT
 );
 CREATE INDEX IF NOT EXISTS events_recent ON events(at DESC);
+CREATE INDEX IF NOT EXISTS events_host_sid ON events(host, session_id, at DESC);
+CREATE TABLE IF NOT EXISTS watcher_health (
+  id TEXT PRIMARY KEY,
+  updated_at REAL NOT NULL,
+  payload TEXT NOT NULL
+);

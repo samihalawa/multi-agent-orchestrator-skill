@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 
 const hosts = ["codex", "claude", "antigravity", "chatgpt", "claude_ai", "gemini_web", "grokbot", "cowork"];
-const kinds = ["seen", "correction", "delivered", "outcome", "error"];
+const kinds = ["seen", "correction", "delivered", "outcome", "error", "manual_followup"];
 const labels = {
   codex: "Codex",
   claude: "Claude Code",
@@ -15,7 +15,7 @@ const labels = {
   grokbot: "Grok",
   cowork: "Cowork",
 };
-const maxBodyLength = 80_000;
+const maxBodyLength = 120_000;
 
 function response(body, status = 200, headers = {}, csp = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'") {
   return new Response(body, {
@@ -38,11 +38,28 @@ function matches(provided, expected) {
 }
 
 function redact(message) {
-  return message
+  return String(message ?? "")
     .replace(/\b(?:sk-or-v1-|sk-proj-|ghp_|github_pat_|ctx7sk-)[A-Za-z0-9_-]+/g, "[credential]")
     .replace(/\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[credential]")
     .replace(/\bBearer\s+[A-Za-z0-9_./+-]{12,}=*/gi, "Bearer [credential]")
     .replace(/\b((?:authorization|api[_-]?key|password|secret|access_token|refresh_token)\s*[:=]\s*)[^\s,;"}]+/gi, "$1[credential]");
+}
+
+function sanitizeJson(val, depth = 0) {
+  if (depth > 4) return null;
+  if (val === null || typeof val === "boolean" || typeof val === "number") {
+    return Number.isFinite(val) || typeof val !== "number" ? val : null;
+  }
+  if (typeof val === "string") return redact(val).slice(0, 300);
+  if (Array.isArray(val)) return val.slice(0, 30).map((x) => sanitizeJson(x, depth + 1));
+  if (typeof val === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(val).slice(0, 40)) {
+      out[String(k).slice(0, 60)] = sanitizeJson(v, depth + 1);
+    }
+    return out;
+  }
+  return null;
 }
 
 function safeUrl(value) {
@@ -60,7 +77,7 @@ function normalize(event, importing = false) {
   if (event.message != null && typeof event.message !== "string") return null;
   if (event.outcome != null && !["verified", "superseded", "pending"].includes(event.outcome)) return null;
   const project = typeof event.project === "string"
-    ? event.project.replace(/[^\w .@+-]/g, "").trim().slice(0, 80) || null
+    ? event.project.replace(/[^\p{L}\p{N} .@+\-_:/()–—]/gu, "").trim().slice(0, 80) || null
     : null;
   const sessionUrl = safeUrl(event.session_url);
   const sessionState = ["ongoing", "completed", "pending", "error", "stopped"].includes(event.session_state)
@@ -80,8 +97,8 @@ function normalize(event, importing = false) {
   ];
 }
 
-async function readBody(request) {
-  const maxBytes = maxBodyLength * 3;
+async function readBody(request, limit = maxBodyLength) {
+  const maxBytes = limit * 3;
   if (Number(request.headers["content-length"]) > maxBytes) return null;
   const chunks = [];
   let bytes = 0;
@@ -91,7 +108,7 @@ async function readBody(request) {
     chunks.push(chunk);
   }
   const body = Buffer.concat(chunks, bytes).toString("utf8");
-  return body.length <= maxBodyLength ? body : null;
+  return body.length <= limit ? body : null;
 }
 
 async function ingest(request, database, feedAuthorization) {
@@ -110,9 +127,39 @@ async function ingest(request, database, feedAuthorization) {
   } catch {
     return response("Invalid JSON", 400);
   }
-  if (!events.length || events.length > 20 || events.includes(null)) return response("Invalid events", 400);
+  if (!events.length || events.length > 40 || events.includes(null)) return response("Invalid events", 400);
   writeEvents(database, events);
   return response(JSON.stringify({ accepted: events.length }), 200, { "Content-Type": "application/json" });
+}
+
+async function ingestWatcher(request, database, feedAuthorization) {
+  if (!matches(request.headers.authorization, feedAuthorization)) {
+    return response("Unauthorized", 401);
+  }
+  if (!/^application\/json\b/i.test(request.headers["content-type"] || "")) {
+    return response("Expected application/json", 415);
+  }
+  const body = await readBody(request, 16_000);
+  if (body === null) return response("Watcher payload too large", 413);
+  let clean;
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return response("Invalid watcher payload", 400);
+    }
+    clean = sanitizeJson(parsed);
+  } catch {
+    return response("Invalid JSON", 400);
+  }
+  const now = Date.now() / 1000;
+  database.prepare(`
+    INSERT INTO watcher_health (id, updated_at, payload)
+    VALUES ('primary', ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      payload = excluded.payload
+  `).run(now, JSON.stringify(clean));
+  return response(JSON.stringify({ accepted: true, at: now }), 200, { "Content-Type": "application/json" });
 }
 
 function writeEvents(database, events) {
@@ -140,6 +187,7 @@ function writeEvents(database, events) {
 }
 
 function queryState(database) {
+  const now = Date.now() / 1000;
   const seenRows = database.prepare(`
     SELECT host, session_id, MAX(at) AS last_at,
       MAX(project) AS project,
@@ -150,20 +198,142 @@ function queryState(database) {
     FROM events
     GROUP BY host, session_id
     ORDER BY last_at DESC
-    LIMIT 180
+    LIMIT 250
   `).all();
   const detailRows = database.prepare(`
     SELECT id, host, session_id, kind, at, message, outcome, project, session_url, session_state
     FROM events
     WHERE kind <> 'seen'
     ORDER BY at DESC
-    LIMIT 500
+    LIMIT 800
   `).all();
-  const heartbeat = database.prepare("SELECT host, MAX(at) AS at FROM events GROUP BY host").all();
+  const heartbeat = database.prepare("SELECT host, MAX(at) AS at, COUNT(DISTINCT session_id) AS sessions FROM events GROUP BY host").all();
+  const watcherRow = database.prepare("SELECT updated_at, payload FROM watcher_health WHERE id = 'primary'").get();
+  let watcher = null;
+  if (watcherRow) {
+    try {
+      const parsed = JSON.parse(watcherRow.payload);
+      watcher = {
+        ...parsed,
+        updated_at: watcherRow.updated_at,
+        age_sec: Math.max(0, Math.round(now - watcherRow.updated_at)),
+        alive: (now - watcherRow.updated_at) < 180,
+      };
+    } catch {}
+  }
+
+  const perHost = {};
+  for (const h of hosts) {
+    perHost[h] = {
+      sessions: 0,
+      last_at: null,
+      corrections: 0,
+      delivered: 0,
+      verified: 0,
+      superseded: 0,
+      pending: 0,
+      errors: 0,
+      manual_followups: 0,
+    };
+  }
+  for (const r of heartbeat) {
+    if (!perHost[r.host]) continue;
+    perHost[r.host].sessions = r.sessions;
+    perHost[r.host].last_at = r.at;
+  }
+
+  const totals = {
+    sessions: 0,
+    corrections: 0,
+    delivered: 0,
+    verified: 0,
+    superseded: 0,
+    pending: 0,
+    errors: 0,
+    manual_followups: 0,
+    last_24h: { corrections: 0, delivered: 0, verified: 0, superseded: 0, errors: 0, manual_followups: 0 },
+  };
+  totals.sessions = Object.values(perHost).reduce((a, b) => a + b.sessions, 0);
+
+  const aggRows = database.prepare(`
+    SELECT host, kind, outcome, COUNT(*) AS cnt,
+      SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS cnt24
+    FROM events
+    WHERE kind <> 'seen'
+    GROUP BY host, kind, outcome
+  `).all(now - 86400);
+
+  for (const r of aggRows) {
+    const h = perHost[r.host];
+    const c = Number(r.cnt || 0);
+    const c24 = Number(r.cnt24 || 0);
+    if (r.kind === "correction") {
+      totals.corrections += c;
+      totals.last_24h.corrections += c24;
+      if (h) h.corrections += c;
+      if (r.outcome === "verified") {
+        totals.verified += c;
+        totals.last_24h.verified += c24;
+        if (h) h.verified += c;
+      } else if (r.outcome === "superseded") {
+        totals.superseded += c;
+        totals.last_24h.superseded += c24;
+        if (h) h.superseded += c;
+      } else if (r.outcome === "pending") {
+        totals.pending += c;
+        if (h) h.pending += c;
+      }
+    } else if (r.kind === "delivered") {
+      totals.delivered += c;
+      totals.last_24h.delivered += c24;
+      if (h) h.delivered += c;
+    } else if (r.kind === "error") {
+      totals.errors += c;
+      totals.last_24h.errors += c24;
+      if (h) h.errors += c;
+    } else if (r.kind === "manual_followup") {
+      totals.manual_followups += c;
+      totals.last_24h.manual_followups += c24;
+      if (h) h.manual_followups += c;
+    }
+  }
+
+  const manualRows = database.prepare(`
+    SELECT host, session_id, project, session_url, at, message
+    FROM events
+    WHERE kind = 'manual_followup'
+    ORDER BY at DESC
+    LIMIT 60
+  `).all();
+  const manualByCategory = {};
+  const recentManual = manualRows.map((r) => {
+    const msg = String(r.message || "");
+    const m = msg.match(/^\[([a-z0-9_]+)\]\s*([\s\S]*)$/i);
+    const category = m ? m[1] : "steering";
+    const snippet = m ? m[2] : msg;
+    manualByCategory[category] = (manualByCategory[category] || 0) + 1;
+    return {
+      host: r.host,
+      session_id: r.session_id,
+      project: r.project,
+      session_url: r.session_url,
+      at: r.at,
+      category,
+      snippet,
+    };
+  });
+
   return {
-    serverTime: Date.now() / 1000,
+    serverTime: now,
     labels,
     hosts: Object.fromEntries(heartbeat.map((r) => [r.host, r.at])),
+    watcher,
+    metrics: {
+      ...totals,
+      manual_by_category: manualByCategory,
+      recent_manual: recentManual.slice(0, 20),
+      per_host: perHost,
+    },
     sessions: seenRows,
     events: detailRows,
   };
@@ -181,20 +351,34 @@ function clientApp() {
     cowork: { label: "Cowork", code: "CW", color: "#FF2D55" },
   };
   const HOST_ORDER = ["codex", "claude", "antigravity", "chatgpt", "claude_ai", "gemini_web", "grokbot", "cowork"];
+  const CATEGORY_LABELS = {
+    sibling_sweep: "Sibling Sweep",
+    live_verification: "Live Runtime Proof",
+    scope_coverage: "Full Coverage",
+    stall_nudge: "Stall / Idle Nudge",
+    route_override: "Route Override",
+    steering: "Steering",
+  };
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
   const isWide = () => innerWidth >= 760;
 
-  let state = { serverTime: Date.now() / 1000, sessions: [], events: [] };
+  let state = { serverTime: Date.now() / 1000, watcher: null, metrics: null, sessions: [], events: [] };
   let sessions = [], filtered = [];
   let fHost = "all", fState = "all", fProject = "all";
-  let selKey = null, selIdx = -1;
+  let selKey = null, selIdx = -1, viewMode = "session";
 
   const relTime = (ts) => {
     if (!ts) return "";
     const d = new Date(ts * 1000), n = new Date();
     if (d.toDateString() === n.toDateString()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     return d.toLocaleDateString([], { day: "numeric", month: "short" });
+  };
+  const ageLabel = (sec) => {
+    if (sec == null) return "";
+    if (sec < 60) return `${sec}s ago`;
+    if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
+    return `${Math.round(sec / 3600)}h ago`;
   };
   const fullTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Madrid", dateStyle: "medium", timeStyle: "short" }) : "";
 
@@ -238,9 +422,39 @@ function clientApp() {
       s.events.sort((a, b) => b.at - a.at);
       s.status = deriveStatus(s, s.events, now);
       s.corrections = s.events.filter((e) => e.kind === "correction").length;
+      s.deliveredCount = s.events.filter((e) => e.kind === "delivered").length;
+      s.manualCount = s.events.filter((e) => e.kind === "manual_followup").length;
       s.latestMsg = (s.events.find((e) => e.message) || {}).message || "";
       return s;
     }).sort((a, b) => (b.last_at || 0) - (a.last_at || 0));
+  }
+
+  function renderHeaderTelemetry() {
+    const w = state.watcher;
+    const wb = $("watcherBar");
+    if (!w) {
+      wb.className = "watcher-pill offline";
+      wb.innerHTML = '<i></i><span>Watcher · awaiting first v1.8+ heartbeat</span>';
+    } else {
+      const live = Boolean(w.alive);
+      wb.className = `watcher-pill ${live ? "on" : "stale"}`;
+      wb.innerHTML = `<i></i><span>Watcher v${esc(w.version || "?")} · ${live ? "Live" : "Stale"} ${esc(ageLabel(w.age_sec))} · ${w.auto_deliver ? "Auto-Deliver ON" : "Observe"} · ${esc(w.ticks ?? 0)} ticks · ${esc(w.deliveries ?? 0)} delivered</span>`;
+    }
+
+    const m = state.metrics || {};
+    const corr = m.corrections ?? 0;
+    const deliv = m.delivered ?? 0;
+    const ver = m.verified ?? 0;
+    const sup = m.superseded ?? 0;
+    const man = m.manual_followups ?? 0;
+    const err = m.errors ?? 0;
+    $("kpiGrid").innerHTML = `
+      <div class="kpi"><div class="kv">${corr}</div><div class="kl">Guardian Prompts</div><div class="ks">${deliv} delivered · ${m.pending ?? 0} open</div></div>
+      <div class="kpi"><div class="kv">${ver}</div><div class="kl">Verified Closed</div><div class="ks">${sup} superseded</div></div>
+      <button class="kpi kpi-btn${fState === "manual" ? " on" : ""}" data-kpi="manual"><div class="kv">${man}</div><div class="kl">Manual Follow-Ups</div><div class="ks">after Guardian</div></button>
+      <button class="kpi kpi-btn${fState === "error" ? " on" : ""}" data-kpi="error"><div class="kv">${err}</div><div class="kl">Observer Errors</div><div class="ks">${m.last_24h?.errors ?? 0} in 24h</div></button>
+    `;
+    $("overviewBtn").classList.toggle("on", viewMode === "overview");
   }
 
   function renderChips() {
@@ -255,12 +469,19 @@ function clientApp() {
     const stCounts = {
       all: baseH.length,
       pending: baseH.filter((s) => s.status === "pending").length,
+      manual: baseH.filter((s) => s.manualCount > 0).length,
       ongoing: baseH.filter((s) => s.status === "ongoing").length,
       completed: baseH.filter((s) => s.status === "completed").length,
       error: baseH.filter((s) => s.status === "error").length,
     };
-    const stItems = [["all", "Any State", null], ["pending", "Needs Action", "#FF9F0A"], ["ongoing", "Ongoing", "#007AFF"], ["completed", "Completed", "#34C759"], ["error", "Errors", "#FF3B30"]]
-      .filter(([k]) => k === "all" || stCounts[k] > 0);
+    const stItems = [
+      ["all", "Any State", null],
+      ["pending", "Needs Action", "#FF9F0A"],
+      ["manual", "Manual Prompt", "#FF2D55"],
+      ["ongoing", "Ongoing", "#007AFF"],
+      ["completed", "Completed", "#34C759"],
+      ["error", "Errors", "#FF3B30"],
+    ].filter(([k]) => k === "all" || stCounts[k] > 0);
     $("stateChips").innerHTML = stItems.map(([k, lbl, col]) =>
       `<button class="chip${fState === k ? " on" : ""}" data-st="${k}">${col ? `<span class="d" style="background:${col}"></span>` : ""}${esc(lbl)} <span class="n">${stCounts[k]}</span></button>`
     ).join("");
@@ -281,11 +502,13 @@ function clientApp() {
     const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Done", "st-completed"], pending: ["Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
     const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
     const sub = s.latestMsg ? s.latestMsg.replace(/\[SAMI'S INTENT GUARDIAN\]\s*/g, "") : (s.events.length ? s.events[0].kind : "No corrections · session monitored");
-    return `<button class="row${s.key === selKey && isWide() ? " sel" : ""}" data-i="${i}">
+    const delivBadge = s.deliveredCount ? `<span class="badge-pill st-completed">✓${s.deliveredCount}</span>` : "";
+    const manBadge = s.manualCount ? `<span class="badge-pill st-manual">Manual×${s.manualCount}</span>` : "";
+    return `<button class="row${viewMode === "session" && s.key === selKey && isWide() ? " sel" : ""}" data-i="${i}">
       <div class="av" style="background:${hm.color}20;color:${hm.color}">${esc(hm.code)}<span class="dot" style="background:${s.status === "ongoing" ? "var(--green)" : s.status === "pending" ? "var(--orange)" : s.status === "error" ? "var(--red)" : "transparent"}"></span></div>
       <div class="rt">
         <div class="rt-top"><div class="rn">${esc(title)}</div><span class="rt2">${esc(relTime(s.last_at))}</span></div>
-        <div class="rsub"><span>${esc(hm.label)}</span><span>·</span><span style="font-family:var(--mono)">${esc(s.session_id.slice(0, 8))}</span><span class="badge-pill ${stCls}">${esc(stLbl)}</span>${s.corrections ? `<span>· ${s.corrections} prompt${s.corrections > 1 ? "s" : ""}</span>` : ""}</div>
+        <div class="rsub"><span>${esc(hm.label)}</span><span>·</span><span style="font-family:var(--mono)">${esc(s.session_id.slice(0, 8))}</span><span class="badge-pill ${stCls}">${esc(stLbl)}</span>${delivBadge}${manBadge}${s.corrections ? `<span>· ${s.corrections}p</span>` : ""}</div>
         <div class="rs">${esc(sub)}</div>
       </div>
       <svg class="chev" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l6 6-6 6"/></svg>
@@ -294,11 +517,12 @@ function clientApp() {
 
   function renderList() {
     buildSessions();
+    renderHeaderTelemetry();
     renderChips();
     const q = $("searchInput").value.trim().toLowerCase();
     filtered = sessions.filter((s) =>
       (fHost === "all" || s.host === fHost) &&
-      (fState === "all" || s.status === fState) &&
+      (fState === "all" || (fState === "manual" ? s.manualCount > 0 : s.status === fState)) &&
       (fProject === "all" || s.project === fProject) &&
       (!q || [s.session_id, s.host, HOST_META[s.host]?.label, s.project, s.latestMsg].join(" ").toLowerCase().includes(q))
     );
@@ -321,7 +545,10 @@ function clientApp() {
     $("list").innerHTML = filtered.length
       ? groups.map(([name, arr]) => `<div class="sec">${esc(name)} · ${arr.length}</div><div class="group">${arr.map((s) => rowHtml(s, idx++)).join("")}</div>`).join("")
       : '<div class="empty">No matching sessions.</div>';
-    if (selKey) {
+
+    if (viewMode === "overview" && isWide()) {
+      renderOverview(false);
+    } else if (selKey) {
       const k = filtered.findIndex((s) => s.key === selKey);
       if (k >= 0) { selIdx = k; renderDetail(false); }
     } else if (isWide() && filtered.length) {
@@ -338,14 +565,33 @@ function clientApp() {
     return null;
   }
 
-  function eventCardHtml(ev, idx) {
-    const kindLbl = { correction: "Guardian Prompt", delivered: "Delivered to Session", outcome: "Outcome", error: "Observer Error" }[ev.kind] || ev.kind;
-    const stPill = ev.outcome ? `<span class="badge-pill ${ev.outcome === "verified" ? "st-completed" : ev.outcome === "pending" ? "st-pending" : "st-stopped"}">${esc(ev.outcome)}</span>` : "";
-    const parts = ev.kind === "correction" && ev.message ? parseCorrectionParts(ev.message) : null;
+  function eventCardHtml(ev, idx, deliveredSet) {
+    const kindLbl = {
+      correction: "Guardian Prompt",
+      delivered: "Delivered to Session",
+      outcome: "Outcome",
+      error: "Observer Error",
+      manual_followup: "Manual Follow-Up Prompt",
+    }[ev.kind] || ev.kind;
+    let stPill = ev.outcome ? `<span class="badge-pill ${ev.outcome === "verified" ? "st-completed" : ev.outcome === "pending" ? "st-pending" : "st-stopped"}">${esc(ev.outcome)}</span>` : "";
     let body = "";
-    if (parts) {
-      body = `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div>`;
-    } else if (ev.message && ["correction", "error"].includes(ev.kind)) {
+    if (ev.kind === "correction" && ev.message) {
+      if (deliveredSet.has(ev.message)) {
+        stPill += '<span class="badge-pill st-completed">✓ Delivered</span>';
+      }
+      const parts = parseCorrectionParts(ev.message);
+      if (parts) {
+        body = `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div>`;
+      } else {
+        body = `<div class="ev-body">${esc(ev.message)}</div>`;
+      }
+    } else if (ev.kind === "manual_followup" && ev.message) {
+      const m = ev.message.match(/^\[([a-z0-9_]+)\]\s*([\s\S]*)$/i);
+      const cat = m ? m[1] : "steering";
+      const snippet = m ? m[2] : ev.message;
+      stPill = `<span class="badge-pill st-manual">${esc(CATEGORY_LABELS[cat] || cat)}</span>`;
+      body = `<div class="ev-body">${esc(snippet)}</div>`;
+    } else if (ev.message && ["error", "delivered"].includes(ev.kind)) {
       body = `<div class="ev-body">${esc(ev.message)}</div>`;
     }
     const copyBtn = ev.kind === "correction" && ev.message ? `<div class="ev-foot"><button class="mini-btn" data-copy-ev="${idx}">Copy Prompt</button></div>` : "";
@@ -357,6 +603,7 @@ function clientApp() {
     const cmd = resumeCommand(s.host, s.session_id, s.session_url);
     const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Completed", "st-completed"], pending: ["Needs Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
     const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
+    const deliveredSet = new Set(s.events.filter((e) => e.kind === "delivered" && e.message).map((e) => e.message));
     return `<div class="d-top">
         <div class="tt">${esc(s.project || hm.label)} · ${esc(s.session_id.slice(0, 8))}</div>
         <div class="navs">
@@ -375,6 +622,8 @@ function clientApp() {
               <div class="hero-tags">
                 <span class="tag">${esc(hm.label)}</span>
                 <span class="badge-pill ${stCls}">${esc(stLbl)}</span>
+                ${s.deliveredCount ? `<span class="badge-pill st-completed">✓ Delivered ×${s.deliveredCount}</span>` : ""}
+                ${s.manualCount ? `<span class="badge-pill st-manual">Manual Follow-Up ×${s.manualCount}</span>` : ""}
                 <span class="tag">${esc(fullTime(s.last_at))}</span>
               </div>
               <div class="sid">${esc(s.session_id)}</div>
@@ -386,13 +635,99 @@ function clientApp() {
           </div>
         </div>
         <div class="ev-sec">Activity &amp; Guardian Prompts · ${s.events.length}</div>
-        <div class="cards">${s.events.length ? s.events.map((e, i) => eventCardHtml(e, i)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions or errors required yet.</div></div>'}</div>
+        <div class="cards">${s.events.length ? s.events.map((e, i) => eventCardHtml(e, i, deliveredSet)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions or errors required yet.</div></div>'}</div>
       </div>`;
+  }
+
+  function overviewHtml(inSheet) {
+    const w = state.watcher || {};
+    const m = state.metrics || {};
+    const perHost = m.per_host || {};
+    const platRows = HOST_ORDER.map((h) => {
+      const hm = HOST_META[h] || { label: h, code: h.slice(0, 2).toUpperCase(), color: "#8E8E93" };
+      const st = perHost[h] || {};
+      const wp = w.per_platform?.[h === "codex" ? "codex_broken_cwd" : h];
+      const last = st.last_at ? relTime(st.last_at) : "—";
+      const wpNote = wp ? (wp.error ? `Err: ${wp.error}` : (wp.last_checked ? "Watched" : "")) : "";
+      return `<button class="plat-card" data-jump-host="${esc(h)}">
+        <div class="plat-head">
+          <div class="av" style="width:32px;height:32px;font-size:12px;border-radius:9px;background:${hm.color}20;color:${hm.color}">${esc(hm.code)}</div>
+          <div class="plat-name"><strong>${esc(hm.label)}</strong><span>${esc(last)}${wpNote ? " · " + esc(wpNote) : ""}</span></div>
+          <span class="plat-sess">${st.sessions || 0}</span>
+        </div>
+        <div class="plat-stats">
+          <span>${st.corrections || 0} prompts</span>
+          <span>${st.delivered || 0} deliv</span>
+          <span>${st.verified || 0} ok</span>
+          <span>${st.manual_followups || 0} manual</span>
+          ${st.errors ? `<span style="color:var(--red)">${st.errors} err</span>` : ""}
+        </div>
+      </button>`;
+    }).join("");
+
+    const cats = Object.entries(m.manual_by_category || {}).sort((a, b) => b[1] - a[1]);
+    const catPills = cats.length
+      ? cats.map(([k, v]) => `<span class="tag">${esc(CATEGORY_LABELS[k] || k)}: <b>${v}</b></span>`).join("")
+      : '<span class="tag">No post-Guardian manual follow-ups logged yet</span>';
+    const recentManual = (m.recent_manual || []).map((r) => {
+      const hm = HOST_META[r.host] || { label: r.host, color: "#8E8E93" };
+      return `<button class="ev-card k-manual_followup ov-row" data-jump-key="${esc(r.host + ":" + r.session_id)}">
+        <div class="ev-head">
+          <strong>${esc(r.project || hm.label)}</strong>
+          <span class="badge-pill st-manual">${esc(CATEGORY_LABELS[r.category] || r.category)}</span>
+          <span class="tag">${esc(hm.label)}</span>
+          <time>${esc(fullTime(r.at))}</time>
+        </div>
+        <div class="ev-body">${esc(r.snippet)}</div>
+      </button>`;
+    }).join("");
+
+    return `<div class="d-top">
+      <div class="tt">System Overview · 7 Platforms + Watcher</div>
+      <div class="navs">${inSheet ? '<button class="glass close-btn" data-act="close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ""}</div>
+    </div>
+    <div class="d-scroll">
+      <div class="hero-card">
+        <div class="hero-row">
+          <div class="av" style="width:44px;height:44px;font-size:15px;background:var(--accent-soft);color:var(--accent)">IG</div>
+          <div class="hero-meta">
+            <h2>Continuous Oversight Health</h2>
+            <div class="hero-tags">
+              <span class="badge-pill ${w.alive ? "st-completed" : "st-pending"}">${w.alive ? `Watcher v${esc(w.version || "?")} Live (${esc(ageLabel(w.age_sec))})` : "Watcher Heartbeat Pending"}</span>
+              ${w.pid ? `<span class="tag">PID ${esc(w.pid)}</span>` : ""}
+              <span class="tag">${esc(w.ticks ?? 0)} ticks · ${esc(w.ai_calls ?? 0)} AI calls · ${esc(w.deliveries ?? 0)} auto-delivered</span>
+              ${w.active_writer_skips ? `<span class="tag">${esc(w.active_writer_skips)} active-writer retries</span>` : ""}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="ev-sec">Platform Coverage Matrix</div>
+      <div class="plat-grid">${platRows}</div>
+      <div class="ev-sec">Where User Still Had to Manually Prompt (${m.manual_followups ?? 0})</div>
+      <div class="hero-card"><div class="hero-tags">${catPills}</div></div>
+      <div class="cards" style="margin-top:10px">${recentManual || '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Zero post-Guardian manual follow-ups captured on v1.8+ yet — new human turns after a Guardian intervention will classify and stream here automatically.</div></div>'}</div>
+    </div>`;
+  }
+
+  function renderOverview(openSheetOnMobile = true) {
+    viewMode = "overview";
+    $("overviewBtn").classList.add("on");
+    document.querySelectorAll("#list .row").forEach((r) => r.classList.remove("sel"));
+    const wide = isWide();
+    const root = wide ? $("main") : $("sheetDetail");
+    root.innerHTML = overviewHtml(!wide);
+    if (!wide && openSheetOnMobile) {
+      $("bd").classList.add("on");
+      $("sheet").classList.add("on");
+      document.body.style.overflow = "hidden";
+    }
   }
 
   function renderDetail(scrollTop) {
     const s = filtered[selIdx];
     if (!s) return;
+    viewMode = "session";
+    $("overviewBtn").classList.remove("on");
     const wide = isWide();
     const root = wide ? $("main") : $("sheetDetail");
     const prevScroll = !scrollTop && root.querySelector(".d-scroll") ? root.querySelector(".d-scroll").scrollTop : 0;
@@ -407,6 +742,17 @@ function clientApp() {
     selKey = filtered[i].key;
     renderDetail(true);
     if (!isWide()) { $("bd").classList.add("on"); $("sheet").classList.add("on"); document.body.style.overflow = "hidden"; }
+  }
+  function openKey(key) {
+    fHost = "all";
+    fState = "all";
+    fProject = "all";
+    $("searchInput").value = "";
+    viewMode = "session";
+    selKey = key;
+    renderList();
+    const idx = filtered.findIndex((s) => s.key === key);
+    if (idx >= 0) openAt(idx);
   }
   function closeSheet() {
     $("sheet").classList.remove("on");
@@ -426,6 +772,22 @@ function clientApp() {
         else openAt(selIdx + (act.dataset.act === "next" ? 1 : -1));
         return;
       }
+      const jHost = e.target.closest("[data-jump-host]");
+      if (jHost) {
+        fHost = jHost.dataset.jumpHost;
+        fState = "all";
+        fProject = "all";
+        viewMode = "session";
+        selKey = null;
+        if (!isWide()) closeSheet();
+        renderList();
+        return;
+      }
+      const jKey = e.target.closest("[data-jump-key]");
+      if (jKey) {
+        openKey(jKey.dataset.jumpKey);
+        return;
+      }
       const cmdBtn = e.target.closest("[data-copy-cmd]");
       if (cmdBtn) {
         navigator.clipboard?.writeText(cmdBtn.dataset.copyCmd).then(() => toast("Copied resume command"), () => toast(cmdBtn.dataset.copyCmd));
@@ -442,6 +804,16 @@ function clientApp() {
   bindRoot($("main"));
   bindRoot($("sheetDetail"));
 
+  $("overviewBtn").onclick = () => renderOverview(true);
+  $("kpiGrid").onclick = (e) => {
+    const btn = e.target.closest("[data-kpi]");
+    if (!btn) return;
+    const target = btn.dataset.kpi;
+    fState = fState === target ? "all" : target;
+    viewMode = "session";
+    selKey = null;
+    renderList();
+  };
   $("hostChips").onclick = (e) => { const b = e.target.closest("[data-host]"); if (b) { fHost = b.dataset.host; renderList(); } };
   $("stateChips").onclick = (e) => { const b = e.target.closest("[data-st]"); if (b) { fState = b.dataset.st; renderList(); } };
   $("projectChips").onclick = (e) => { const b = e.target.closest("[data-proj]"); if (b) { fProject = b.dataset.proj; renderList(); } };
@@ -487,7 +859,7 @@ function dashboardHtml() {
   --green:#34C759;--green-soft:rgba(52,199,89,.14);
   --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.15);
   --red:#FF3B30;--red-soft:rgba(255,59,48,.14);
-  --purple:#AF52DE;--teal:#30B0C7;--indigo:#5856D6;--pink:#FF2D55;
+  --purple:#AF52DE;--teal:#30B0C7;--indigo:#5856D6;--pink:#FF2D55;--pink-soft:rgba(255,45,85,.14);
   --bg:#F2F2F7;--card:#FFFFFF;--label:#101114;--label-2:rgba(60,60,67,.62);--label-3:rgba(60,60,67,.36);
   --sep:rgba(60,60,67,.16);--fill:rgba(118,118,128,.12);--bar:rgba(249,249,249,.86);
   --text:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,"Helvetica Neue",Arial,sans-serif;
@@ -501,6 +873,7 @@ function dashboardHtml() {
     --green:#30D158;--green-soft:rgba(48,209,88,.18);
     --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.18);
     --red:#FF453A;--red-soft:rgba(255,69,58,.18);
+    --pink:#FF375F;--pink-soft:rgba(255,55,95,.2);
     --bg:#000000;--card:#1C1C1E;--label:#FFFFFF;--label-2:rgba(235,235,245,.62);--label-3:rgba(235,235,245,.34);
     --sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);--bar:rgba(22,22,24,.86);
   }
@@ -523,7 +896,9 @@ svg{display:block}
 .navbar.solid{background:var(--bar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom-color:var(--sep)}
 .navbar .t{font-weight:600;font-size:17px;opacity:0;transition:opacity .2s}
 .navbar.solid .t{opacity:1}
-.navbar .r{position:absolute;right:12px;top:calc(var(--st) + 6px);display:flex;gap:4px}
+.navbar .r{position:absolute;right:12px;top:calc(var(--st) + 6px);display:flex;gap:6px;align-items:center}
+.pill-btn{height:30px;padding:0 10px;border-radius:15px;background:var(--fill);color:var(--accent);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:4px}
+.pill-btn.on{background:var(--accent);color:#fff}
 .ib{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;color:var(--accent)}
 .ib svg{width:19px;height:19px}
 .ib.spin svg{animation:spin .8s linear infinite}
@@ -533,11 +908,23 @@ svg{display:block}
 .status{display:flex;align-items:center;gap:6px;margin-top:4px;font-size:12.5px;color:var(--label-2)}
 .status i{width:7px;height:7px;border-radius:50%;background:var(--label-3);flex:none}
 .status.live i{background:var(--green);box-shadow:0 0 0 3px var(--green-soft)}
-.search{margin:12px 16px 0;display:flex;align-items:center;gap:7px;background:var(--fill);border-radius:10px;height:36px;padding:0 10px;color:var(--label-2)}
+.watcher-pill{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11.5px;color:var(--label-2);background:var(--card);padding:5px 10px;border-radius:9px}
+.watcher-pill i{width:6px;height:6px;border-radius:50%;background:var(--label-3);flex:none}
+.watcher-pill.on i{background:var(--green)}
+.watcher-pill.stale i{background:var(--orange)}
+.kpi-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:10px 16px 0}
+.kpi{background:var(--card);border-radius:11px;padding:9px 11px;text-align:left;transition:transform .12s,background .15s}
+.kpi-btn:active{transform:scale(.97)}
+.kpi-btn.on{background:var(--label);color:var(--bg)}
+.kpi-btn.on .kl,.kpi-btn.on .ks{color:var(--bg);opacity:.78}
+.kv{font-family:var(--round);font-size:20px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.kl{font-size:11.5px;font-weight:600;margin-top:2px}
+.ks{font-size:11px;color:var(--label-2);margin-top:1px}
+.search{margin:10px 16px 0;display:flex;align-items:center;gap:7px;background:var(--fill);border-radius:10px;height:36px;padding:0 10px;color:var(--label-2)}
 .search svg{width:16px;height:16px;flex:none}
 .search input{flex:1;border:0;background:none;font:inherit;font-size:15px;color:var(--label);outline:none;min-width:0}
 .search input::placeholder{color:var(--label-2)}
-.chips{display:flex;gap:7px;overflow-x:auto;padding:10px 16px 0;scrollbar-width:none}
+.chips{display:flex;gap:7px;overflow-x:auto;padding:9px 16px 0;scrollbar-width:none}
 .chips::-webkit-scrollbar{display:none}
 .chip{flex:none;height:30px;padding:0 11px;border-radius:15px;background:var(--card);font-size:13px;font-weight:500;display:flex;align-items:center;gap:6px;box-shadow:0 .5px 1px rgba(0,0,0,.05);transition:transform .12s,background .15s}
 .chip:active{transform:scale(.96)}
@@ -545,7 +932,7 @@ svg{display:block}
 .chip .n{color:var(--label-2);font-weight:400;font-variant-numeric:tabular-nums}
 .chip.on{background:var(--label);color:var(--bg)}
 .chip.on .n{color:var(--bg);opacity:.72}
-.sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:18px 28px 6px}
+.sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:16px 28px 6px}
 .group{margin:0 16px;background:var(--card);border-radius:12px;overflow:hidden}
 .row{display:flex;align-items:center;gap:11px;padding:10px 14px 10px 12px;width:100%;text-align:left;position:relative;transition:background .12s}
 .row:active{background:var(--fill)}
@@ -560,7 +947,7 @@ svg{display:block}
 .rt-top{display:flex;align-items:baseline;gap:6px;min-width:0}
 .rn{font-size:15.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 .rt2{font-size:12px;color:var(--label-3);flex:none;font-variant-numeric:tabular-nums}
-.rsub{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--label-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rsub{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--label-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rs{font-size:13px;color:var(--label-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
 .chev{width:8px;height:14px;color:var(--label-3);flex:none}
 @media (min-width:760px){.chev{display:none}}
@@ -569,6 +956,7 @@ svg{display:block}
 .st-completed{background:var(--green-soft);color:var(--green)}
 .st-pending{background:var(--orange-soft);color:var(--orange)}
 .st-error{background:var(--red-soft);color:var(--red)}
+.st-manual{background:var(--pink-soft);color:var(--pink)}
 .st-stopped{background:var(--fill);color:var(--label-2)}
 .empty{text-align:center;color:var(--label-2);padding:48px 20px;font-size:14px}
 .detail{height:100%;display:flex;flex-direction:column;background:var(--bg);position:relative}
@@ -595,11 +983,13 @@ svg{display:block}
 .act svg{width:16px;height:16px;flex:none}
 .ev-sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:18px 4px 8px}
 .cards{display:flex;flex-direction:column;gap:10px}
-.ev-card{background:var(--card);border-radius:12px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;border-left:3px solid transparent}
+.ev-card{background:var(--card);border-radius:12px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;border-left:3px solid transparent;text-align:left;width:100%}
 .ev-card.k-correction{border-left-color:var(--accent)}
 .ev-card.k-error{border-left-color:var(--red)}
 .ev-card.k-delivered{border-left-color:var(--green)}
 .ev-card.k-outcome{border-left-color:var(--purple)}
+.ev-card.k-manual_followup{border-left-color:var(--pink)}
+.ov-row:active{transform:scale(.99)}
 .ev-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ev-head time{font-size:12px;color:var(--label-2);margin-left:auto;font-variant-numeric:tabular-nums}
 .ev-body{font-size:14px;line-height:1.48;white-space:pre-wrap;word-break:break-word;color:var(--label)}
@@ -608,6 +998,15 @@ svg{display:block}
 .ev-foot{display:flex;justify-content:flex-end}
 .mini-btn{font-size:12px;font-weight:600;color:var(--accent);background:var(--accent-soft);padding:4px 10px;border-radius:7px}
 .mini-btn:active{opacity:.75}
+.plat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
+.plat-card{background:var(--card);border-radius:12px;padding:11px 12px;text-align:left;display:flex;flex-direction:column;gap:8px}
+.plat-card:active{transform:scale(.98)}
+.plat-head{display:flex;align-items:center;gap:9px}
+.plat-name{flex:1;min-width:0;display:flex;flex-direction:column}
+.plat-name strong{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.plat-name span{font-size:11.5px;color:var(--label-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.plat-sess{font-family:var(--round);font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+.plat-stats{display:flex;flex-wrap:wrap;gap:8px;font-size:11.5px;color:var(--label-2)}
 .bd{position:fixed;inset:0;background:rgba(0,0,0,.42);opacity:0;pointer-events:none;transition:opacity .28s;z-index:40}
 .bd.on{opacity:1;pointer-events:auto}
 .sheet{position:fixed;left:0;right:0;bottom:0;top:calc(14px + var(--st));z-index:41;background:var(--bg);border-radius:14px 14px 0 0;transform:translateY(105%);transition:transform .38s var(--ease);overflow:hidden;box-shadow:0 -10px 40px rgba(0,0,0,.18)}
@@ -625,6 +1024,7 @@ svg{display:block}
     <div class="navbar" id="navbar">
       <div class="t">Intent Guardian</div>
       <div class="r">
+        <button class="pill-btn" id="overviewBtn" aria-label="Overview">Overview</button>
         <button class="ib" id="refreshBtn" aria-label="Refresh">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
         </button>
@@ -633,7 +1033,9 @@ svg{display:block}
     <div class="large">
       <h1>Intent Guardian</h1>
       <div class="status" id="statusBar"><i></i><span>Connecting…</span></div>
+      <div class="watcher-pill" id="watcherBar"><i></i><span>Watcher · loading…</span></div>
     </div>
+    <div class="kpi-grid" id="kpiGrid"></div>
     <label class="search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4.2-4.2"/></svg>
       <input id="searchInput" type="search" placeholder="Search session, project, prompt…" autocomplete="off">
@@ -671,6 +1073,7 @@ function serve(database, feedToken, readerPassword) {
       return response("OK");
     }
     if (route === "/events" && request.method === "POST") return ingest(request, database, feedAuthorization);
+    if (route === "/watcher" && request.method === "POST") return ingestWatcher(request, database, feedAuthorization);
     if (route === "/api/state" && request.method === "GET") {
       if (!matches(request.headers.authorization, readerAuthorization)) {
         return response("Unauthorized", 401, { "WWW-Authenticate": 'Basic realm="Intent Guardian", charset="UTF-8"' });

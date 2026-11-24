@@ -41,6 +41,7 @@ const ONCE = ARGS.has('--once');
 const NO_DELIVER = ARGS.has('--no-deliver');
 const SEED_ONLY = ARGS.has('--seed-only');
 
+const WATCHER_VERSION = '1.8.0';
 const GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]";
 const DEFAULT_INTERVAL_MS = 15_000;
 const STABLE_MS = 10_000;
@@ -463,6 +464,59 @@ function runPythonGuardian(args, stdinJson = null) {
   });
 }
 
+async function recordDelivery(host, sid, feedbackHash, sourceId) {
+  try {
+    await runPythonGuardian([
+      'record-delivery',
+      '--host', host,
+      '--session-id', sid,
+      '--feedback-hash', feedbackHash || '',
+      '--source-id', sourceId || 'watcher',
+    ]);
+  } catch (e) {
+    log(`[record-delivery-warn] ${host}:${sid}: ${e.message}`);
+  }
+}
+
+async function publishWatcherHealth(state, cfg) {
+  const feedUrl = cfg.feed_url;
+  if (!feedUrl || !feedUrl.startsWith('https://')) return false;
+  let token = process.env.GUARDIAN_FEED_TOKEN || '';
+  if (!token && cfg.feed_token_file) {
+    try {
+      const p = cfg.feed_token_file.replace(/^~(?=\/|$)/, HOME);
+      token = readFileSync(p, 'utf8').trim();
+    } catch {
+      return false;
+    }
+  }
+  if (!token) return false;
+  const watcherUrl = feedUrl.replace(/\/events\/?$/, '/watcher');
+  const payload = {
+    version: WATCHER_VERSION,
+    pid: process.pid,
+    interval_ms: Number(cfg.watcher_interval_ms) || DEFAULT_INTERVAL_MS,
+    auto_deliver: cfg.watcher_auto_deliver !== false && !NO_DELIVER,
+    seen_count: Object.keys(state.seen || {}).length,
+    ...state.health,
+  };
+  try {
+    const res = await fetch(watcherUrl, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'user-agent': `IntentGuardianWatcher/${WATCHER_VERSION}`,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(2500),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 function sendCodexTurn(threadId, text) {
   return new Promise((resolve, reject) => {
     if (!existsSync(CODEX_DESKTOP_BIN)) {
@@ -504,7 +558,7 @@ function sendCodexTurn(threadId, text) {
         }
       }
     });
-    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'guardian-watcher', version: '1.7.0' } } });
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'guardian-watcher', version: WATCHER_VERSION } } });
   });
 }
 
@@ -629,6 +683,7 @@ async function handleWebCandidate(state, cfg, candidate, isColdStart) {
     state.seen[key].auto_sent_count = autoCount + 1;
     state.seen[key].last_sent_at = Date.now();
     state.health.deliveries = (state.health.deliveries || 0) + 1;
+    await recordDelivery(host, sid, res.feedback_hash, `cdp-dom:${sent.method}`);
     log(`[delivered] ${key} via ${sent.method}`);
   } else {
     log(`[deliver-failed] ${key}: ${JSON.stringify(sent)}`);
@@ -935,6 +990,37 @@ function inspectCodexRollout(filePath) {
 
 async function sweepBrokenCwdCodex(state, cfg) {
   const now = Date.now();
+  const autoDeliver = cfg.watcher_auto_deliver !== false && !NO_DELIVER;
+  for (const [key, entry] of Object.entries(state.seen || {})) {
+    const q = entry?.pending_codex_delivery;
+    if (!q) continue;
+    let currentMtime = null;
+    try { currentMtime = statSync(q.filePath).mtimeMs; } catch {}
+    if (!currentMtime || currentMtime !== q.mtimeMs || q.attempts >= 3 || (now - (q.queued_at || now) > 600_000)) {
+      delete entry.pending_codex_delivery;
+      continue;
+    }
+    if (!autoDeliver || now < (q.next_retry_at || 0)) continue;
+    try {
+      await sendCodexTurn(q.sid, q.correction);
+      entry.auto_sent_count = (entry.auto_sent_count || 0) + 1;
+      entry.last_sent_at = Date.now();
+      delete entry.pending_codex_delivery;
+      state.health.deliveries = (state.health.deliveries || 0) + 1;
+      await recordDelivery('codex', q.sid, q.feedback_hash, 'codex-app-server-retry');
+      log(`[codex-delivered-retry] sid=${q.sid} attempt=${q.attempts}`);
+    } catch (e) {
+      if (/active writer/i.test(e.message || '')) {
+        q.attempts = (q.attempts || 1) + 1;
+        q.next_retry_at = Date.now() + 60_000;
+        state.health.active_writer_skips = (state.health.active_writer_skips || 0) + 1;
+      } else {
+        delete entry.pending_codex_delivery;
+        log(`[codex-deliver-retry-failed] sid=${q.sid}: ${e.message}`);
+      }
+    }
+  }
+
   const files = recentCodexSessionFiles();
   let audited = 0;
   for (const { path: filePath, mtimeMs } of files) {
@@ -970,15 +1056,33 @@ async function sweepBrokenCwdCodex(state, cfg) {
       notifyMac('Intent Guardian (codex)', res.last_review?.decision?.reason || correction.slice(0, 140));
       const key = `codex:${info.sid}`;
       const prev = state.seen[key] || {};
-      const autoDeliver = cfg.watcher_auto_deliver !== false && !NO_DELIVER;
       if (autoDeliver && (prev.auto_sent_count || 0) < MAX_AUTO_PER_USER_TURN && now - (prev.last_sent_at || 0) > DELIVERY_COOLDOWN_MS) {
         try {
           await sendCodexTurn(info.sid, correction);
           state.seen[key] = { ...prev, auto_sent_count: (prev.auto_sent_count || 0) + 1, last_sent_at: Date.now() };
           state.health.deliveries = (state.health.deliveries || 0) + 1;
+          await recordDelivery('codex', info.sid, res.feedback_hash, 'codex-app-server');
           log(`[codex-delivered] sid=${info.sid} via app-server turn/start`);
         } catch (e) {
-          log(`[codex-deliver-failed] sid=${info.sid}: ${e.message}`);
+          if (/active writer/i.test(e.message || '')) {
+            state.health.active_writer_skips = (state.health.active_writer_skips || 0) + 1;
+            state.seen[key] = {
+              ...prev,
+              pending_codex_delivery: {
+                sid: info.sid,
+                filePath,
+                mtimeMs,
+                correction,
+                feedback_hash: res.feedback_hash || '',
+                attempts: 1,
+                queued_at: Date.now(),
+                next_retry_at: Date.now() + 45_000,
+              },
+            };
+            log(`[codex-deliver-queued] sid=${info.sid}: active writer, retry in 45s`);
+          } else {
+            log(`[codex-deliver-failed] sid=${info.sid}: ${e.message}`);
+          }
         }
       }
     }
@@ -991,6 +1095,7 @@ async function tick(state) {
   rotateLogIfLarge();
   const cfg = loadConfig();
   const isColdStart = !state.health.ticks;
+  const prevDeliveries = state.health.deliveries || 0;
   state.health.ticks = (state.health.ticks || 0) + 1;
   state.health.last_tick_at = new Date().toISOString();
 
@@ -1034,6 +1139,9 @@ async function tick(state) {
   state.health.last_success_at = new Date().toISOString();
   state.health.last_error = null;
   saveState(state);
+  if (ONCE || state.health.ticks % 4 === 1 || (state.health.deliveries || 0) > prevDeliveries) {
+    await publishWatcherHealth(state, cfg);
+  }
 }
 
 async function main() {
@@ -1064,7 +1172,7 @@ async function main() {
     });
   }
 
-  log(`guardian_watcher started (interval=${loadConfig().watcher_interval_ms || DEFAULT_INTERVAL_MS}ms, auto_deliver=${loadConfig().watcher_auto_deliver !== false && !NO_DELIVER})`);
+  log(`guardian_watcher v${WATCHER_VERSION} started (interval=${loadConfig().watcher_interval_ms || DEFAULT_INTERVAL_MS}ms, auto_deliver=${loadConfig().watcher_auto_deliver !== false && !NO_DELIVER})`);
   while (!stopping) {
     if (!running) {
       running = true;

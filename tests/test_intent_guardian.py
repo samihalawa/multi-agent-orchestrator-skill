@@ -893,6 +893,118 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(events[0]["session_state"], "pending")
         self.assertNotIn("secret_payload", json.dumps(events))
 
+    def test_antigravity_system_message_task_result_ingested_as_tool_evidence(self):
+        task_msg = {
+            "step_index": 5,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T22:00:00Z sender=agy-conv-99/task-193\nTask id \"agy-conv-99/task-193\" finished with result: verified OK\n</SYSTEM_MESSAGE>",
+        }
+        reminder_msg = {
+            "step_index": 6,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "content": "<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>",
+        }
+        self.assertEqual([k for k, _, _ in g.records(task_msg, "antigravity", 5)], ["tool"])
+        self.assertEqual(g.records(reminder_msg, "antigravity", 6), [])
+
+        # A subagent prompt starting with bare sender=<uuid> still marks subagent=True
+        subagent_transcript = self.root / "agy-subagent.jsonl"
+        subagent_transcript.write_text(json.dumps({
+            "step_index": 1, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T22:00:00Z sender=05002099-f578-4b01-a50c-fd566c350000\nDo subagent work\n</SYSTEM_MESSAGE>",
+        }) + "\n")
+        _, sub_state = g.process_event({
+            "conversationId": "agy-sub-1",
+            "transcriptPath": str(subagent_transcript),
+            "hookEventName": "Stop",
+        }, "antigravity", self.cfg, self.root / "state")
+        self.assertTrue(sub_state.get("subagent"))
+
+        # A background task completion with sender=<uuid>/task-193 must NOT mark subagent=True
+        main_transcript = self.root / "agy-main.jsonl"
+        main_transcript.write_text(json.dumps(task_msg) + "\n")
+        _, main_state = g.process_event({
+            "conversationId": "agy-main-1",
+            "transcriptPath": str(main_transcript),
+            "hookEventName": "UserPromptSubmit",
+            "prompt": "Run task and verify",
+        }, "antigravity", self.cfg, self.root / "state")
+        self.assertFalse(main_state.get("subagent"))
+
+    def test_normalize_decision_clears_unproven_resolved_and_empty_completed(self):
+        payload = {
+            "event": "Stop",
+            "intent": [{"id": "e:u1", "kind": "user", "text": "Finish job"}],
+            "evidence": [{"id": "e:a1", "kind": "assistant", "text": "Claimed done"}],
+            "pending_correction": {
+                "review_evidence_ids": ["e:u1"],
+                "review_tool_digests": [],
+            },
+        }
+        cleaned = g.normalize_decision({
+            "intervene": False,
+            "resolved": True,
+            "completed": True,
+            "verdict_domain": "closure",
+            "evidence_ids": ["e:a1"],
+            "resolution_evidence_ids": ["e:a1"],
+        }, payload)
+        self.assertFalse(cleaned["resolved"])
+        self.assertFalse(cleaned["completed"])
+        g.validate_decision(cleaned, payload)
+
+    def test_record_delivery_and_manual_followup_emitted_to_feed(self):
+        state_dir = self.root / "state"
+        out, state = g.process_event({
+            "session_id": "gemini-live-1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Updated one file.",
+            "_project_name": "整理健康建议",
+            "_controller_job": {"prompt": "Fix all 4 files", "evidence": ["edited 1 of 4"]},
+        }, "gemini_web", self.cfg, state_dir, reviewer=lambda c, p: (
+            {
+                "intervene": True, "verdict_domain": "closure",
+                "reason": "Only 1 of 4 files edited.",
+                "next_action": "Finish the remaining 3 sibling files.",
+                "proof_needed": "Verification readback for all 4.",
+                "evidence_ids": [p["evidence"][-1]["id"]],
+            },
+            {"usage": {}},
+        ))
+        self.assertIn("DO NOT STOP", out["hookSpecificOutput"]["additionalContext"])
+        fhash = state["pending"]["feedback_hash"]
+
+        # Record delivery via CLI command on isolated state dir
+        rc = g.main([
+            "record-delivery", "--host", "gemini_web",
+            "--config", str(self.root / "missing-cfg.json"),
+            "--state-dir", str(state_dir),
+            "--session-id", "gemini-live-1",
+            "--feedback-hash", fhash,
+            "--source-id", "cdp-dom:button",
+        ])
+        self.assertEqual(rc, 0)
+
+        # Next human follow-up after Guardian should be recorded as manual_followup
+        _, state = g.process_event({
+            "session_id": "gemini-live-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "/address-all-similar-instances-skill is it working?",
+        }, "codex", self.cfg, state_dir)
+        # Note: same host+session creates feed events on gemini_web too
+        _, gstate = g.process_event({
+            "session_id": "gemini-live-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "/address-all-similar-instances-skill",
+        }, "gemini_web", self.cfg, state_dir)
+        self.assertEqual(len(gstate["manual_followups"]), 1)
+        self.assertEqual(gstate["manual_followups"][0]["category"], "sibling_sweep")
+        evts = g.feed_events(gstate)
+        self.assertTrue(any(e["kind"] == "delivered" for e in evts))
+        self.assertTrue(any(e["kind"] == "manual_followup" and "[sibling_sweep]" in e["message"] for e in evts))
+        self.assertEqual(evts[0]["project"], "整理健康建议")
 
 
 if __name__ == "__main__":
