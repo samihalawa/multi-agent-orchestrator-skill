@@ -1873,7 +1873,8 @@ function evalInTab(wsUrl, expression) {
     } catch {}
     if (!result) {
       const tabs = await (await fetch(cdp + "/json/list")).json();
-      const tab = tabs.find(t => t.type === "page" && t.url && (sidArg ? t.url.includes("claude.ai/chat/" + sidArg) : t.url.startsWith("https://claude.ai/")));
+      const tab = tabs.find(t => t.type === "page" && t.url && sidArg && t.url.includes("claude.ai/chat/" + sidArg))
+        || tabs.find(t => t.type === "page" && t.url && t.url.startsWith("https://claude.ai/"));
       if (!tab?.webSocketDebuggerUrl) throw new Error("Claude.ai direct fetch blocked by Cloudflare and no open claude.ai tab in Chrome CDP");
       result = await evalInTab(tab.webSocketDebuggerUrl, `(async () => {
         const orgs = await fetch("/api/organizations").then(r => r.json());
