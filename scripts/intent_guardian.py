@@ -74,11 +74,11 @@ Intervene ONLY for a concrete, evidenced defect needing correction NOW:
 - repeating an unchanged failed route instead of switching to a working supported route;
 - draft/report replacing execution, lost prior constraints/work, wrong closeout format, or
   unverified completion claims.
-Stay quiet (`intervene: false`) when normal forward progress is under way, when a negative
-existence/diagnostic check intentionally verified a missing path/state (`|| true`, probe),
-when a native background task/subagent is actively running AND the agent stated it will
-resume on completion, or when physical visual proof is impossible and software/API readback
-already verified the outcome.
+Stay quiet (`intervene: false`, `completed: false`) when normal forward progress is under way,
+when a negative existence/diagnostic check intentionally verified a missing path/state (`|| true`, probe),
+when `native_background_tasks` is non-empty / a subagent or background task is actively running and the
+executor is pausing to receive its completion (NEVER block a Stop just to say "wait/resume when the subagent completes"),
+or when physical visual proof is impossible and software/API readback already verified the outcome.
 Authorized routes & polarity: assume full access to existing host credentials, CLIs, and
 sessions (op, gcloud, adc.json, SSH, c7, shared Chrome 127.0.0.1:9222) unless the OWNER
 explicitly forbade that exact route in `intent`; never inherit assistant caution or bans.
@@ -732,6 +732,17 @@ def guard_review_phase(decision, payload):
         if domain != "active_route":
             decision["intervene"] = False
             decision["verdict_domain"] = "none"
+    if decision.get("intervene") and is_stop:
+        running_bg = isinstance(payload.get("native_background_tasks"), list) and any(
+            isinstance(t, dict) and t.get("status") == "running" for t in payload["native_background_tasks"]
+        )
+        if running_bg and not is_question_stop({}, payload):
+            wait_only = re.search(r"\b(?:resume when|once .* completes|wait for (?:the )?(?:subagent|background|investigator|worker))\b", decision.get("next_action", ""), re.I)
+            if wait_only:
+                deferred = {"domain": domain, "reason": "Running background task reactive wait preserved",
+                            "evidence_ids": decision.get("evidence_ids", []), "phase": "closure"}
+                decision["intervene"] = False
+                decision["verdict_domain"] = "none"
     return decision, deferred
 
 

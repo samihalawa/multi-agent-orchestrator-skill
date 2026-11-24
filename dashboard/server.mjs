@@ -331,9 +331,9 @@ function clientApp() {
 
   function parseCorrectionParts(msg) {
     const clean = msg.replace(/^\[SAMI'S INTENT GUARDIAN\]\s*(DO NOT STOP[^\n]*\n)?/, "").trim();
-    const gap = (clean.match(/(?:^|\n)Gap:\s*([\s\S]*?)(?=\nExecute now|\nNext action:|$)/i) || [])[1];
-    const exec = (clean.match(/(?:^|\n)(?:Execute now[^:]*:|Next action:)\s*([\s\S]*?)(?=\nVerify[^:]*:|$)/i) || [])[1];
-    const verify = (clean.match(/(?:^|\n)Verify[^:]*:\s*([\s\S]*)$/i) || [])[1];
+    const gap = (clean.match(/(?:^|\n)Gap:\s*([\s\S]*?)(?=\n(?:Execute now|Next action)|\nVerify|$)/i) || [])[1];
+    const exec = (clean.match(/(?:^|\n)(?:Execute now[^\n]*?\):|Next action:)\s*([\s\S]*?)(?=\nVerify[^\n]*:|$)/i) || [])[1];
+    const verify = (clean.match(/(?:^|\n)Verify[^\n]*:\s*([\s\S]*)$/i) || [])[1];
     if (gap || exec || verify) return { gap, exec, verify };
     return null;
   }
@@ -382,7 +382,7 @@ function clientApp() {
           </div>
           <div class="acts">
             ${s.session_url ? `<a class="act primary" href="${esc(s.session_url)}" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14L21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Open Session</a>` : ""}
-            <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy Resume" : "Copy: " + esc(cmd.slice(0, 26))}</button>
+            <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy Resume" : "Copy Resume Command"}</button>
           </div>
         </div>
         <div class="ev-sec">Activity &amp; Guardian Prompts · ${s.events.length}</div>
