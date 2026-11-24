@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -166,16 +166,23 @@ def classify_prompt(text):
 
 
 def runtime_task_request(payload):
-    # Native create_thread transports the new task's original request in a
-    # function result, rather than a UserMessage. Preserve its task provenance;
-    # arbitrary tool outputs never become fresh human authority.
-    if payload.get("name") != "create_thread" or payload.get("namespace") != "codex_app":
+    # Native create_thread and automation_update transport a task's original
+    # request in a codex_app function result, rather than a UserMessage.
+    # Preserve task provenance; arbitrary tool outputs never become authority.
+    if payload.get("namespace") != "codex_app":
         return ""
+    name = payload.get("name")
     output = payload.get("output", "")
-    if not isinstance(output, str) or not output.startswith("<codex_delegation>") or not output.rstrip().endswith("</codex_delegation>"):
+    if not isinstance(output, str):
         return ""
-    match = re.search(r"<input>([\s\S]*)</input>", output)
-    return match.group(1).strip() if match else ""
+    if name == "create_thread":
+        if not output.startswith("<codex_delegation>") or not output.rstrip().endswith("</codex_delegation>"):
+            return ""
+        match = re.search(r"<input>([\s\S]*)</input>", output)
+        return match.group(1).strip() if match else ""
+    if name == "automation_update" and output.lstrip().startswith("Automation:"):
+        return output.strip()
+    return ""
 
 
 def _strip_antigravity_user_request(text):
@@ -235,7 +242,9 @@ def records(row, host, line_number):
         result = []
         if typ == "user":
             blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
-            human = "\n".join(flatten(x) for x in blocks if isinstance(x, dict) and x.get("type") in {"text", "input_text"})
+            text_parts = [re.sub(r"<system-reminder>[\s\S]*?</system-reminder>\s*", "", flatten(x))
+                          for x in blocks if isinstance(x, dict) and x.get("type") in {"text", "input_text"}]
+            human = "\n".join(part for part in text_parts if part.strip())
             if human.strip() in CLAUDE_INTERRUPT_MARKERS:
                 result.append(("control", "interrupt", source_id))
             elif real_prompt(human):
@@ -460,6 +469,14 @@ def ingest(state, event, host):
                         if meta.get("id") == state["session_id"]:
                             state["subagent"] = bool(meta.get("thread_source") == "subagent"
                                                      or isinstance(source, dict) and source.get("subagent"))
+                    elif host == "antigravity":
+                        row_type = row.get("type")
+                        if row_type == "USER_INPUT":
+                            state["subagent"] = False
+                        elif row_type == "SYSTEM_MESSAGE" and not state["intent"]:
+                            sys_text = flatten(row.get("content", ""))
+                            if GUARDIAN_TAG not in sys_text and re.search(r"\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}", sys_text):
+                                state["subagent"] = True
                     for kind, text, sid in records(row, host, state["line"]):
                         if kind == "runtime_feedback":
                             cleaned_fb = text.strip()
