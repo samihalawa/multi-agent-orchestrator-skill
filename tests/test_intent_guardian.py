@@ -700,6 +700,84 @@ class GuardianContracts(unittest.TestCase):
         self.run_event(self.event("Stop", last_assistant_message="Requested follow-up output is present here."), done)
         self.assertEqual(len(self.calls), 2)
 
+    def test_high_signal_checkpoint_fires_before_checkpoint_every(self):
+        self.cfg["checkpoint_every"] = 20
+        self.run_event(self.event("UserPromptSubmit", prompt="Check all files"))
+        self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="file 1 ok"))
+        self.assertEqual(len(self.calls), 0)
+        self.run_event(self.event("PostToolUse", tool_name="Bash", tool_response="UNAUTHORIZED: HTTP 401"))
+        self.assertEqual(len(self.calls), 1)
+        self.run_event(self.event("PostToolUse", tool_name="mcp__ccd_turn__wrap_up", tool_response="Shown in next-step box"))
+        self.assertEqual(len(self.calls), 2)
+
+    def test_native_exit_category_recognizes_claude_five_hour_limit_as_quota(self):
+        self.assertEqual(g.native_exit_category("You've hit your 5-hour limit · resets 2pm (Europe/Madrid) · out of usage credits"), "quota")
+
+    def test_normalize_decision_repairs_stale_compaction_and_abbreviated_ids(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Verify complete file"))
+        self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="Readback complete"))
+        def sloppy(cfg, payload):
+            eid = payload["evidence"][-1]["id"]
+            return {
+                "intervene": False, "resolved": True, "completed": False,
+                "verdict_domain": "none", "reason": "All ok.", "next_action": "", "proof_needed": "",
+                "evidence_ids": [eid[:10] + "..."], "resolution_evidence_ids": [],
+                "summarized_intent_ids": ["e:nonexistent-old"], "state_delta": "Verified."
+            }, {"usage": {"input_tokens": 5, "cache_read_input_tokens": 1200, "output_tokens": 40}}
+        out, state = self.run_event(self.event("Stop", last_assistant_message="Done."), sloppy)
+        self.assertEqual(out, {})
+        self.assertEqual(state["status"], "reviewed")
+        self.assertNotIn("model_error", state)
+        self.assertEqual(state["observed_review_tokens"]["input_tokens"], 1205)
+        self.assertEqual(state["observed_review_tokens"]["cached_input_tokens"], 1200)
+
+    def test_near_duplicate_stop_nag_is_suppressed_and_question_stop_overrides(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Finish the deployment"))
+        calls = []
+        def nag(cfg, payload):
+            calls.append(payload)
+            return {
+                "intervene": True, "verdict_domain": "closure",
+                "reason": "Deployment not verified yet.",
+                "next_action": f"Wait for background deploy job {len(calls)} and verify the live endpoint.",
+                "proof_needed": "Live health 200.",
+                "evidence_ids": [payload["evidence"][-1]["id"]] if payload["evidence"] else [payload["intent"][0]["id"]],
+            }, {"usage": {}}
+        first, state = self.run_event(self.event("Stop"), nag)
+        self.assertIn("decision", first)
+        self.run_event(self.event("PostToolUse", tool_name="check_job", tool_response="Job still running at step 2"))
+        second, state = self.run_event(self.event("Stop", stop_hook_active=True, last_assistant_message="Still waiting on job."), nag)
+        self.assertEqual(second, {})
+        self.assertTrue(state["last_review"]["suppressed_pending_intervention"])
+        self.run_event(self.event("PostToolUse", tool_name="mcp__ccd_turn__wrap_up", tool_response="Asked user"))
+        third, state = self.run_event(self.event("Stop", last_assistant_message="Should I deploy now?"), nag)
+        self.assertIn("decision", third)
+        self.assertEqual(state["interventions"], 2)
+
+    def test_stop_interventions_capped_at_three_per_revision(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Finish all steps"))
+        for idx, action in enumerate([
+            "Check alpha service logs",
+            "Inspect beta database schema",
+            "Verify gamma storage bucket",
+            "Confirm delta DNS propagation",
+        ], 1):
+            self.run_event(self.event("PostToolUse", tool_name="Bash", tool_response=f"step {idx} result"))
+            out, state = self.run_event(
+                self.event("Stop", last_assistant_message=f"Finished step {idx}."),
+                lambda cfg, payload, act=action: (
+                    {"intervene": True, "verdict_domain": "closure", "reason": f"Missing {act}",
+                     "next_action": act, "proof_needed": "Readback.",
+                     "evidence_ids": [next(e["id"] for e in reversed(payload["evidence"]) if e["kind"] == "tool")]},
+                    {"usage": {}},
+                ),
+            )
+            if idx <= 3:
+                self.assertIn("decision", out)
+            else:
+                self.assertEqual(out, {})
+                self.assertTrue(state["last_review"]["suppressed_pending_intervention"])
+
 
 if __name__ == "__main__":
     unittest.main()
