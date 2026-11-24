@@ -91,8 +91,9 @@ JSON output ONLY:
  "verdict_domain":"active_route"|"closure"|"none"}.
 Copy exact full IDs from `intent`/`evidence` in THIS packet (never abbreviate with ...
 or cite prior_state_delta). Every intervention/completion requires supplied IDs;
-completion requires primary tool proof, not assistant claims. Mark resolved:true only
-with NEW primary tool proof absent from pending_correction. Do not reissue an unchanged
+completion requires primary tool proof, not assistant claims. A text-only answer
+without tool proof must stop quietly with intervene:false, completed:false. Mark
+resolved:true only with NEW primary tool proof absent from pending_correction. Do not reissue an unchanged
 unresolved correction unless the executor asks the owner an avoidable question or new
 primary tool evidence materially changes the required next action.
 Keep state_delta under 1800 chars (outcome, limits, verified progress, remaining work).
@@ -1081,6 +1082,10 @@ def normalize_decision(decision, payload):
                 d["resolution_evidence_ids"] = list(dict.fromkeys(d["resolution_evidence_ids"] + promoted))
             elif not d.get("intervene") and not d.get("completed"):
                 d["resolved"] = False
+    if d.get("completed") and not d.get("intervene"):
+        comp_ids = set(d["evidence_ids"]) | (set(d["resolution_evidence_ids"]) if d.get("resolved") else set())
+        if comp_ids and not any(e["id"] in comp_ids and e["kind"] == "tool" for e in payload["evidence"]):
+            d["completed"] = False
     return d
 
 
