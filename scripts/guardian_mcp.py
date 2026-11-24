@@ -18,7 +18,7 @@ import time
 from intent_guardian import DEFAULT_CONFIG, DEFAULT_STATE, VERSION, backend_chain, digest, policy_text
 
 server = FastMCP("intent-guardian")
-HOSTS = ("codex", "claude", "cowork", "grokbot", "antigravity")
+HOSTS = ("codex", "claude", "cowork", "grokbot", "antigravity", "chatgpt", "claude_ai", "gemini_web")
 
 
 @server.tool()

@@ -868,6 +868,31 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(out_cancel, {})
         self.assertTrue(state["interrupted"])
 
+    def test_v16_imperative_prompt_and_safe_dashboard_metadata(self):
+        out, state = g.process_event({
+            "session_id": "6afc8591-f038-83ed-878c-d2ff8a091ece",
+            "cwd": "/tmp/work/alpha-project",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Only checked 1 item.",
+            "_controller_job": {"prompt": "Fix all 5 endpoints secret_payload", "evidence": ["checked 1 only"]},
+        }, "chatgpt", self.cfg, self.root / "state", reviewer=lambda c, p: (
+            {
+                "intervene": True, "verdict_domain": "closure",
+                "reason": "You finished only 1 of 5 endpoints.",
+                "next_action": "Fix the remaining 4 endpoints in parallel and verify all 5 return HTTP 200.",
+                "proof_needed": "HTTP 200 readback for all 5 endpoints.",
+                "evidence_ids": [p["evidence"][-1]["id"]],
+            },
+            {"usage": {}},
+        ))
+        self.assertIn("DO NOT STOP", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("Execute now", out["hookSpecificOutput"]["additionalContext"])
+        events = g.feed_events(state)
+        self.assertEqual(events[0]["project"], "alpha-project")
+        self.assertEqual(events[0]["session_url"], "https://chatgpt.com/c/6afc8591-f038-83ed-878c-d2ff8a091ece")
+        self.assertEqual(events[0]["session_state"], "pending")
+        self.assertNotIn("secret_payload", json.dumps(events))
+
 
 
 if __name__ == "__main__":
