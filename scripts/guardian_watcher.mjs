@@ -896,13 +896,20 @@ function inspectCodexRollout(filePath) {
 
   let lastUserLine = -1;
   let lastDoneLine = -1;
+  let lastTaskStart = -1;
+  let lastTaskEnd = -1;
   let userCount = 0;
   for (let i = 0; i < lines.length; i++) {
     let row;
     try { row = JSON.parse(lines[i]); } catch { continue; }
     const t = row.type;
     const p = row.payload || {};
-    if (t === 'event_msg' && p.type === 'user_message' && (p.message || '').trim()) {
+    if (t === 'event_msg' && p.type === 'task_started') {
+      lastTaskStart = i;
+    } else if (t === 'event_msg' && (p.type === 'task_complete' || p.type === 'turn_aborted')) {
+      lastTaskEnd = i;
+      lastDoneLine = i;
+    } else if (t === 'event_msg' && p.type === 'user_message' && (p.message || '').trim()) {
       userCount++;
       lastUserLine = i;
     } else if (t === 'response_item' && p.type === 'message' && p.role === 'user') {
@@ -916,13 +923,13 @@ function inspectCodexRollout(filePath) {
     } else if (t === 'response_item' && p.type === 'function_call_output' && p.namespace === 'codex_app' && (p.name === 'create_thread' || p.name === 'automation_update')) {
       userCount++;
       lastUserLine = i;
-    } else if (t === 'event_msg' && (p.type === 'agent_message' || p.type === 'task_complete')) {
+    } else if (t === 'event_msg' && p.type === 'agent_message') {
       lastDoneLine = i;
     } else if (t === 'response_item' && p.type === 'message' && p.role === 'assistant') {
       lastDoneLine = i;
     }
   }
-  if (!userCount || lastDoneLine <= lastUserLine) return null;
+  if (!userCount || lastTaskStart > lastTaskEnd || lastDoneLine <= lastUserLine) return null;
   return { sid, cwd, userCount };
 }
 
