@@ -3,9 +3,9 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 
-const hosts = ["codex", "claude", "cowork", "grokbot"];
+const hosts = ["codex", "claude", "cowork", "grokbot", "antigravity"];
 const kinds = ["seen", "correction", "delivered", "outcome", "error"];
-const labels = { codex: "Codex", claude: "Claude Code", cowork: "Cowork", grokbot: "GrokBot" };
+const labels = { codex: "Codex", claude: "Claude Code", cowork: "Cowork", grokbot: "GrokBot", antigravity: "Antigravity" };
 const maxBodyLength = 80_000;
 
 function response(body, status = 200, headers = {}) {

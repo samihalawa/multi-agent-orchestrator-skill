@@ -778,6 +778,97 @@ class GuardianContracts(unittest.TestCase):
                 self.assertEqual(out, {})
                 self.assertTrue(state["last_review"]["suppressed_pending_intervention"])
 
+    def test_antigravity_transcript_and_hook_contracts(self):
+        state_dir = self.root / "state"
+        transcript = self.root / "antigravity.jsonl"
+        transcript.write_text("\n".join([
+            json.dumps({
+                "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nFix all 3 endpoints and verify live health\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nOS: mac\n</ADDITIONAL_METADATA>",
+            }),
+            json.dumps({
+                "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+                "thinking": "PRIVATE THINKING DO NOT INGEST",
+                "content": "Checking first endpoint only.",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "curl localhost:8080"}}],
+            }),
+            json.dumps({
+                "step_index": 2, "source": "MODEL", "type": "GENERIC",
+                "content": "HTTP 500 internal error",
+            }),
+        ]) + "\n")
+        post_tool = {
+            "conversationId": "agy-conv-1",
+            "transcriptPath": str(transcript),
+            "lastUserInput": "Fix all 3 endpoints and verify live health",
+            "hookEventName": "PostToolUse",
+            "toolCall": {"id": "call-1", "name": "run_command", "args": {"CommandLine": "curl localhost:8080"}},
+            "error": "exit status 1",
+        }
+        out_tool, state = g.process_event(post_tool, "antigravity", self.cfg, state_dir,
+                                          reviewer=lambda c, p: self.fail("PostToolUse must defer review to PostInvocation"))
+        self.assertEqual(out_tool, {})
+        self.assertTrue(state.get("high_signal_pending"))
+        self.assertNotIn("PRIVATE THINKING DO NOT INGEST", json.dumps(state["evidence"]))
+        self.assertEqual(state["intent"][0]["text"], "Fix all 3 endpoints and verify live health")
+
+        def intervene(cfg, payload):
+            self.calls.append(payload)
+            tool_id = next(e["id"] for e in reversed(payload["evidence"]) if e["kind"] == "tool")
+            return {
+                "intervene": True, "verdict_domain": "active_route",
+                "reason": "Command failed HTTP 500 while 2 endpoints remain unchecked.",
+                "next_action": "Inspect server logs and fix all 3 endpoints.",
+                "proof_needed": "200 responses from all 3 endpoints.",
+                "evidence_ids": [tool_id],
+            }, {"usage": {}}
+
+        out_inv, state = g.process_event({
+            "conversationId": "agy-conv-1",
+            "transcriptPath": str(transcript),
+            "hookEventName": "PostInvocation",
+            "invocationNum": 2,
+        }, "antigravity", self.cfg, state_dir, reviewer=intervene)
+        self.assertEqual(out_inv["terminationBehavior"], "force_continue")
+        msg = out_inv["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("[SAMI'S INTENT GUARDIAN]", msg)
+        self.assertFalse(state.get("high_signal_pending"))
+
+        with transcript.open("a") as stream:
+            stream.write(json.dumps({"step_index": 3, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                                     "content": f"<SYSTEM_MESSAGE>\n{msg}\n</SYSTEM_MESSAGE>"}) + "\n")
+            stream.write(json.dumps({"step_index": 4, "source": "MODEL", "type": "GENERIC",
+                                     "content": "All 3 endpoints returned HTTP 200 OK"}) + "\n")
+
+        out_stop, state = g.process_event({
+            "conversationId": "agy-conv-1",
+            "transcriptPath": str(transcript),
+            "hookEventName": "Stop",
+            "terminationReason": "NO_TOOL_CALL",
+            "fullyIdle": True,
+        }, "antigravity", self.cfg, state_dir, reviewer=lambda c, p: (
+            {"intervene": True, "verdict_domain": "closure",
+             "reason": "Closure still needs final check.", "next_action": "Run health check.",
+             "proof_needed": "Health check output.", "evidence_ids": [p["evidence"][-1]["id"]]},
+            {"usage": {}},
+        ))
+        self.assertEqual(out_stop["decision"], "continue")
+        self.assertIn("[SAMI'S INTENT GUARDIAN]", out_stop["reason"])
+        first_hash = next(iter(state["corrections"]))
+        self.assertIn("delivery", state["corrections"][first_hash])
+
+        out_cancel, state = g.process_event({
+            "conversationId": "agy-conv-1",
+            "transcriptPath": str(transcript),
+            "hookEventName": "Stop",
+            "terminationReason": "USER_CANCELED",
+            "fullyIdle": True,
+        }, "antigravity", self.cfg, state_dir,
+            reviewer=lambda c, p: self.fail("USER_CANCELED must never call judge"))
+        self.assertEqual(out_cancel, {})
+        self.assertTrue(state["interrupted"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

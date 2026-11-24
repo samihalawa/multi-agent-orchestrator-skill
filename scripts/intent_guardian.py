@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Portable, event-driven intent oversight for Codex and Claude Code.
+"""Portable, event-driven intent oversight for Codex, Claude Code, and Antigravity.
 
 No daemon, idle polling, tool execution, or authority changes. Native hosts call
-``hook --host codex|claude`` with their JSON event on stdin. ``audit`` evaluates
-an explicitly selected real transcript; it never sends messages by itself.
+``hook --host codex|claude|antigravity`` with their JSON event on stdin. ``audit``
+evaluates an explicitly selected real transcript; it never sends messages by itself.
 """
 from __future__ import annotations
 
@@ -23,14 +23,14 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 LEARNED_PATTERNS = DEFAULT_CONFIG.with_name("learned-patterns.json")
 DEFAULT_STATE = Path.home() / ".local/state/intent-guardian"
-OBSERVE_EVENTS = {"SessionStart", "UserPromptSubmit", "PostCompact", "Interrupt", "SessionEnd"}
-REVIEW_EVENTS = {"Stop", "PreToolUse", "PostToolUse", "PostToolUseFailure"}
+OBSERVE_EVENTS = {"SessionStart", "UserPromptSubmit", "PostCompact", "PreInvocation", "Interrupt", "SessionEnd"}
+REVIEW_EVENTS = {"Stop", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostInvocation"}
 NOISE_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<system-reminder>",
                   "<task-notification>", "This session is being continued from a previous conversation",
                   "<local-command-", "<command-name>")
@@ -171,9 +171,45 @@ def runtime_task_request(payload):
     return match.group(1).strip() if match else ""
 
 
+def _strip_antigravity_user_request(text):
+    match = re.search(r"<USER_REQUEST>\s*([\s\S]*?)\s*</USER_REQUEST>", text)
+    if match:
+        return match.group(1).strip()
+    return re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", text).strip()
+
+
 def records(row, host, line_number):
     """Extract public task data only; no hidden reasoning or injected instructions."""
     source_id = str(row.get("uuid") or row.get("ordinal") or line_number)
+    if host == "antigravity":
+        typ = row.get("type")
+        agy_id = str(row.get("step_index") if row.get("step_index") is not None else line_number)
+        if typ == "SYSTEM_MESSAGE":
+            text = flatten(row.get("content", ""))
+            if GUARDIAN_TAG in text:
+                feedback = text[text.index(GUARDIAN_TAG):]
+                feedback = re.sub(r"\s*</SYSTEM_MESSAGE>\s*$", "", feedback).strip()
+                return [("runtime_feedback", feedback, agy_id)]
+            return []
+        if typ == "USER_INPUT":
+            human = _strip_antigravity_user_request(flatten(row.get("content", "")))
+            return [("user", human, agy_id)] if real_prompt(human) else []
+        if typ == "PLANNER_RESPONSE":
+            result = []
+            text = flatten(row.get("content", ""))
+            if text.strip():
+                result.append(("assistant", text, agy_id + ":text"))
+            calls = row.get("tool_calls") or []
+            if isinstance(calls, list):
+                for i, call in enumerate(calls):
+                    if isinstance(call, dict):
+                        cid = str(call.get("id") or f"{agy_id}:call:{i}")
+                        result.append(("action", str(call.get("name", "tool")) + " " + json.dumps(call.get("args", {}), ensure_ascii=False), cid))
+            return result
+        if typ == "GENERIC":
+            text = flatten(row.get("content", ""))
+            return [("tool", text, agy_id + ":result")] if text.strip() else []
+        return []
     if host in {"claude", "cowork"}:
         if row.get("isSidechain"):
             return []
@@ -419,7 +455,14 @@ def ingest(state, event, host):
                                                      or isinstance(source, dict) and source.get("subagent"))
                     for kind, text, sid in records(row, host, state["line"]):
                         if kind == "runtime_feedback":
-                            correction = state.get("corrections", {}).get(digest(text.strip()))
+                            cleaned_fb = text.strip()
+                            correction = state.get("corrections", {}).get(digest(cleaned_fb))
+                            if correction is None:
+                                correction = next(
+                                    (c for c in state.get("corrections", {}).values()
+                                     if c.get("message") and (cleaned_fb.startswith(c["message"][:200]) or c["message"] in cleaned_fb)),
+                                    None,
+                                )
                             if correction is not None:
                                 correction.setdefault("delivery", {"source_id": str(sid), "line": state["line"],
                                                                    "transcript": str(path)})
@@ -461,14 +504,22 @@ def ingest(state, event, host):
             state["hook_prompt_serial"] = state.get("hook_prompt_serial", 0) + 1
             add_evidence(state, "user", prompt, "prompt:" + str(state["hook_prompt_serial"]) + ":" + digest(prompt)[:16])
             state["pending_hook_prompt"] = {"hash": digest(prompt)}
+    elif host == "antigravity" and not state["intent"] and real_prompt(str(event.get("_antigravity_last_user_input") or "")):
+        prompt = redact(event["_antigravity_last_user_input"]).strip()
+        if classify_prompt(prompt)[0] != "runtime_feedback" and digest(prompt) not in state.get("emitted_feedback_hashes", []):
+            state["hook_prompt_serial"] = state.get("hook_prompt_serial", 0) + 1
+            add_evidence(state, "user", prompt, "prompt:" + str(state["hook_prompt_serial"]) + ":" + digest(prompt)[:16])
+            state["pending_hook_prompt"] = {"hash": digest(prompt)}
     if event.get("hook_event_name") == "PreToolUse":
         arguments = event.get("tool_input", {})
         text = str(event.get("tool_name", "tool")) + " " + (arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False))
         add_evidence(state, "action", text, "pre-event:" + digest(text)[:16])
     if event.get("hook_event_name") in {"PostToolUse", "PostToolUseFailure"}:
-        text = str(event.get("tool_name", "tool")) + " " + flatten(event.get("tool_response", event.get("tool_result", event.get("error", ""))))
-        if text.strip() != "tool":
-            add_evidence(state, "tool", text, "event:" + digest(text)[:16])
+        detail = flatten(event.get("tool_response", event.get("tool_result", event.get("error", ""))))
+        if host != "antigravity" or detail.strip():
+            text = str(event.get("tool_name", "tool")) + " " + detail
+            if text.strip() != "tool":
+                add_evidence(state, "tool", text, "event:" + digest(text)[:16])
     if event.get("last_assistant_message"):
         add_evidence(state, "assistant", event["last_assistant_message"], "last:" + digest(event["last_assistant_message"])[:16])
 
@@ -582,7 +633,8 @@ def review_payload(state, event, budget=None):
     meaning = {"Stop": "Executor proposes ending its turn; this is not a human stop/cancellation instruction",
                "PreToolUse": "Executor is actively working; checkpoint before its next tool",
                "PostToolUse": "Executor is actively working; checkpoint after its tool",
-               "PostToolUseFailure": "Executor is actively working; its tool failed and may need a changed route"}.get(name, "Observation-only lifecycle event")
+               "PostToolUseFailure": "Executor is actively working; its tool failed and may need a changed route",
+               "PostInvocation": "Executor finished a planner invocation; checkpoint whether active route drifted"}.get(name, "Observation-only lifecycle event")
     native_tasks = event.get("background_tasks")
     background_tasks = None
     if name == "Stop" and isinstance(native_tasks, list):
@@ -991,6 +1043,13 @@ def validate_decision(decision, payload):
 
 def emit_correction(event, decision, host="codex"):
     correction = GUARDIAN_TAG + " " + bounded(decision["reason"], 650) + " Next action: " + bounded(decision["next_action"], 900) + " Verify: " + bounded(decision["proof_needed"], 650)
+    if host == "antigravity":
+        if event == "Stop":
+            return {"decision": "continue", "reason": correction}
+        if event in {"PreInvocation", "PostInvocation", "SessionStart"}:
+            return {"injectSteps": [{"systemMessage": {"systemMessage": correction}}],
+                    "terminationBehavior": "force_continue" if event == "PostInvocation" else ""}
+        return {}
     if event == "Stop" and host == "codex":
         return {"decision": "block", "reason": correction}
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": correction}}
@@ -1023,6 +1082,8 @@ def is_question_stop(event, payload):
 def high_signal_checkpoint(event):
     tool_name = str(event.get("tool_name", ""))
     if any(t in tool_name for t in HIGH_SIGNAL_TOOLS):
+        return True
+    if flatten(event.get("error", "")).strip():
         return True
     resp = flatten(event.get("tool_response", event.get("tool_result", event.get("error", ""))))
     return bool(resp and HIGH_SIGNAL_OUTPUT_RE.search(resp))
@@ -1272,8 +1333,40 @@ def run_review_chain(cfg, state_dir, state, event, reviewer):
     raise error
 
 
+def normalize_host_event(event, host):
+    """Map host-specific camelCase hook envelopes onto internal snake_case fields."""
+    normalized = dict(event)
+    if not normalized.get("session_id"):
+        normalized["session_id"] = normalized.get("conversationId") or normalized.get("sessionId") or ""
+    if not normalized.get("transcript_path") and normalized.get("transcriptPath"):
+        normalized["transcript_path"] = normalized["transcriptPath"]
+    if not normalized.get("hook_event_name") and normalized.get("hookEventName"):
+        normalized["hook_event_name"] = normalized["hookEventName"]
+    if host == "antigravity":
+        tool_call = normalized.get("toolCall")
+        if isinstance(tool_call, dict):
+            normalized.setdefault("tool_name", tool_call.get("name", ""))
+            if "args" in tool_call:
+                normalized.setdefault("tool_input", tool_call["args"])
+        if "lastUserInput" in normalized:
+            normalized["_antigravity_last_user_input"] = normalized.get("lastUserInput")
+        if normalized.get("hook_event_name") == "Stop":
+            reason = str(normalized.get("terminationReason") or "")
+            if reason == "USER_CANCELED":
+                normalized["_antigravity_interrupted"] = True
+            elif reason and reason not in {"NO_TOOL_CALL", "TERMINAL_STEP_TYPE"}:
+                normalized["_antigravity_non_overridable_stop"] = True
+            if normalized.get("fullyIdle") is False and "background_tasks" not in normalized:
+                normalized["background_tasks"] = [{
+                    "id": "antigravity-background", "type": "background_task",
+                    "status": "running", "description": "Antigravity background tasks still running (fullyIdle=false)",
+                }]
+    return normalized
+
+
 def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False):
-    session_id = str(event.get("session_id") or event.get("sessionId") or "")
+    event = normalize_host_event(event, host)
+    session_id = str(event.get("session_id") or "")
     name = event.get("hook_event_name", "")
     if not session_id or name not in OBSERVE_EVENTS | REVIEW_EVENTS:
         return {}, {"status": "ignored", "reason": "missing identity or unsupported event"}
@@ -1336,22 +1429,31 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         state["events"].append({"event": name, "at": time.time(), "offset": state["offset"]})
         state["events"] = state["events"][-64:]
         # Interrupt and session end never restart a deliberately stopped executor.
-        if name == "Interrupt":
+        if name == "Interrupt" or event.get("_antigravity_interrupted"):
             state["interrupted"] = True
         if name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
             state["events_since_review"] += 1
+            if host == "antigravity" and high_signal_checkpoint(event):
+                state["high_signal_pending"] = True
         payload = review_payload(state, event)
         hash_fields = {key: payload[key] for key in ("review_phase", "intent", "evidence", "native_background_tasks")}
         if name == "PostToolUseFailure":
             failure = redact(flatten(event.get("error", event.get("tool_response", event.get("tool_result", "")))))
             hash_fields["failed_route"] = digest([event.get("tool_name"), event.get("tool_input"), failure, state.get("human_revision", 0)])
         content_hash = digest(hash_fields)
-        due = (force or name in {"Stop", "PostToolUseFailure"}
-               or (name in {"PreToolUse", "PostToolUse"}
-                   and (state["events_since_review"] >= int(cfg["checkpoint_every"])
-                        or high_signal_checkpoint(event))))
+        if host == "antigravity" and name in {"PreToolUse", "PostToolUse"}:
+            due = False
+        elif host == "antigravity" and name == "PostInvocation":
+            due = bool(force or state["events_since_review"] >= int(cfg["checkpoint_every"]) or state.get("high_signal_pending") or high_signal_checkpoint(event))
+        else:
+            due = (force or name in {"Stop", "PostToolUseFailure"}
+                   or (name in {"PreToolUse", "PostToolUse"}
+                       and (state["events_since_review"] >= int(cfg["checkpoint_every"])
+                            or high_signal_checkpoint(event))))
         why = "observed"
-        if state.get("subagent") or os.environ.get("INTENT_GUARDIAN_OBSERVER") == "1":
+        if event.get("_antigravity_non_overridable_stop"):
+            due, why = False, "non-overridable executor termination (" + str(event.get("terminationReason", "")) + ")"
+        elif state.get("subagent") or os.environ.get("INTENT_GUARDIAN_OBSERVER") == "1":
             due, why = False, "observer/subagent recursion excluded"
         elif state.get("interrupted"):
             due, why = False, "explicit interrupt preserved"
@@ -1429,6 +1531,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     state["last_review"]["deferred_model_verdict"] = deferred_closure
                 state["reviewed_hash"] = content_hash
                 state["events_since_review"] = 0
+                state.pop("high_signal_pending", None)
                 state["state_delta"] = redact(bounded(decision.get("state_delta", ""), 1800))
                 compact_reviewed_intent(state, decision)
                 refreshed = review_payload(state, event)
@@ -1459,7 +1562,11 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     can_emit = (not pending or pending_revision != current_revision or supersedes) and not stop_cap_hit
                     if can_emit and correction_hash != state.get("last_correction_hash"):
                         output = emit_correction(name, decision, host)
-                        feedback = output.get("reason") or output.get("hookSpecificOutput", {}).get("additionalContext", "")
+                        feedback = (
+                            output.get("reason")
+                            or output.get("hookSpecificOutput", {}).get("additionalContext")
+                            or next((step.get("systemMessage", {}).get("systemMessage", "") for step in output.get("injectSteps", []) if isinstance(step, dict)), "")
+                        )
                         feedback_hash = digest(feedback.strip())
                         state["emitted_feedback_hashes"] = (state.get("emitted_feedback_hashes", []) + [feedback_hash])[-16:]
                         corrections = state.setdefault("corrections", {})
@@ -1580,7 +1687,7 @@ def publish_feed(cfg, state):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["hook", "audit", "review-job", "sync-feed", "status", "health"])
-    parser.add_argument("--host", choices=["codex", "claude", "cowork", "grokbot"], default="codex")
+    parser.add_argument("--host", choices=["codex", "claude", "cowork", "grokbot", "antigravity"], default="codex")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--session-id")
@@ -1666,7 +1773,7 @@ def main(argv=None):
                 output, state = process_event(event, args.host, cfg, Path(isolated), force=True)
         else:
             output, state = process_event(event, args.host, cfg, args.state_dir, force=args.command == "audit")
-        if args.command == "review-job" or (args.command == "hook" and state.get("last_event") in {"SessionStart", "Stop"}):
+        if args.command == "review-job" or (args.command == "hook" and state.get("last_event") in {"SessionStart", "PostInvocation", "Stop"}):
             publish_feed(cfg, state)
         if args.command in {"audit", "review-job"}:
             print(json.dumps({"hook_output": output, "status": state.get("status"), "last_review": state.get("last_review"), "pending": state.get("pending"), "last_resolution": state.get("last_resolution"), "model_error": state.get("model_error"),
