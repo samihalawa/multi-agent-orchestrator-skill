@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -1398,7 +1398,7 @@ def _session_url(host, session_id, state=None):
     if host == "gemini_web":
         return f"https://gemini.google.com/app/{sid}"
     if host == "grokbot" and re.fullmatch(r"[0-9a-f-]{16,64}", sid, re.I):
-        return f"https://grok.com/chat/{sid}"
+        return f"https://grok.com/c/{sid}"
     if host == "codex":
         return f"codex://threads/{sid}"
     return None
@@ -1782,9 +1782,21 @@ def publish_feed(cfg, state):
 
 
 def fetch_web_session(host, session_id=None, cdp_url="http://127.0.0.1:9222"):
-    """Fetch public conversation turns from chatgpt/grokbot/claude_ai/gemini_web via live Chrome CDP or CLI."""
+    """Fetch public conversation turns from chatgpt/grokbot/claude_ai/gemini_web via live Chrome CDP."""
     script = r"""
 const [host, sidArg, cdp] = process.argv.slice(1);
+function evalInTab(wsUrl, expression) {
+  return new Promise((res, rej) => {
+    const ws = new WebSocket(wsUrl);
+    const t = setTimeout(() => { try { ws.close(); } catch {} rej(new Error("Tab eval timeout")); }, 7000);
+    ws.onerror = () => { clearTimeout(t); rej(new Error("Tab ws error")); };
+    ws.onopen = () => ws.send(JSON.stringify({id:1, method:"Runtime.evaluate", params:{expression, returnByValue:true, awaitPromise:true}}));
+    ws.onmessage = e => {
+      const m = JSON.parse(e.data);
+      if (m.id === 1) { clearTimeout(t); ws.close(); res(m.result?.result?.value ?? null); }
+    };
+  });
+}
 (async () => {
   const v = await (await fetch(cdp + "/json/version")).json();
   const ws = new WebSocket(v.webSocketDebuggerUrl);
@@ -1836,40 +1848,81 @@ const [host, sidArg, cdp] = process.argv.slice(1);
     const turns = (loaded.responses || []).filter(r => r.message).map(r => ({
       role: r.sender === "human" ? "user" : "assistant", text: String(r.message)
     }));
-    console.log(JSON.stringify({session_id: sid, url: "https://grok.com/chat/" + sid, turns}));
+    console.log(JSON.stringify({session_id: sid, url: "https://grok.com/c/" + sid, turns}));
   } else if (host === "claude_ai") {
     const cookie = hdr("claude.ai");
-    const orgs = await (await fetch("https://claude.ai/api/organizations", {headers:{cookie}})).json();
-    const orgId = Array.isArray(orgs) && orgs[0]?.uuid;
-    if (!orgId) throw new Error("Claude.ai session unavailable");
-    let sid = sidArg;
-    if (!sid) {
-      const lst = await (await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations`, {headers:{cookie}})).json();
-      sid = Array.isArray(lst) && lst[0]?.uuid;
+    let result = null;
+    try {
+      const orgs = await (await fetch("https://claude.ai/api/organizations", {headers:{cookie}})).json();
+      const orgId = Array.isArray(orgs) && orgs[0]?.uuid;
+      if (orgId) {
+        let sid = sidArg;
+        if (!sid) {
+          const lst = await (await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations`, {headers:{cookie}})).json();
+          sid = Array.isArray(lst) && lst[0]?.uuid;
+        }
+        if (sid) {
+          const conv = await (await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations/${sid}?tree=True&rendering_mode=messages&consistency=strong`, {headers:{cookie}})).json();
+          const turns = (conv.chat_messages || []).map(m => ({
+            role: m.sender === "human" ? "user" : "assistant",
+            text: String(m.text || (m.content || []).map(c => c.text || "").join("\n")).trim(),
+          })).filter(t => t.text);
+          result = {session_id: sid, url: "https://claude.ai/chat/" + sid, title: conv.name || "", turns};
+        }
+      }
+    } catch {}
+    if (!result) {
+      const tabs = await (await fetch(cdp + "/json/list")).json();
+      const tab = tabs.find(t => t.type === "page" && t.url && (sidArg ? t.url.includes("claude.ai/chat/" + sidArg) : t.url.startsWith("https://claude.ai/")));
+      if (!tab?.webSocketDebuggerUrl) throw new Error("Claude.ai direct fetch blocked by Cloudflare and no open claude.ai tab in Chrome CDP");
+      result = await evalInTab(tab.webSocketDebuggerUrl, `(async () => {
+        const orgs = await fetch("/api/organizations").then(r => r.json());
+        const orgId = Array.isArray(orgs) && orgs[0]?.uuid;
+        if (!orgId) throw new Error("Claude.ai session unavailable");
+        let sid = ${JSON.stringify(sidArg || "")};
+        if (!sid) {
+          const lst = await fetch("/api/organizations/" + orgId + "/chat_conversations?limit=1").then(r => r.json());
+          sid = Array.isArray(lst) && lst[0]?.uuid;
+        }
+        if (!sid) throw new Error("No Claude.ai conversation found");
+        const conv = await fetch("/api/organizations/" + orgId + "/chat_conversations/" + sid + "?tree=True&rendering_mode=messages&consistency=strong").then(r => r.json());
+        const turns = (conv.chat_messages || []).map(m => ({
+          role: m.sender === "human" ? "user" : "assistant",
+          text: String(m.text || (m.content || []).map(c => c.text || "").join("\\n")).trim(),
+        })).filter(t => t.text);
+        return {session_id: sid, url: "https://claude.ai/chat/" + sid, title: conv.name || "", turns};
+      })()`);
     }
-    if (!sid) throw new Error("No Claude.ai conversation found");
-    const conv = await (await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations/${sid}?tree=True&rendering_mode=messages&consistency=strong`, {headers:{cookie}})).json();
-    const turns = (conv.chat_messages || []).map(m => ({
-      role: m.sender === "human" ? "user" : "assistant",
-      text: String(m.text || (m.content || []).map(c => c.text || "").join("\n")).trim(),
-    })).filter(t => t.text);
-    console.log(JSON.stringify({session_id: sid, url: "https://claude.ai/chat/" + sid, title: conv.name || "", turns}));
+    console.log(JSON.stringify(result));
+  } else if (host === "gemini_web") {
+    const tabs = await (await fetch(cdp + "/json/list")).json();
+    const tab = tabs.find(t => t.type === "page" && t.url && (sidArg ? t.url.includes("gemini.google.com/app/" + sidArg.replace(/^c_/, "")) : t.url.includes("gemini.google.com/app/")));
+    if (!tab?.webSocketDebuggerUrl) throw new Error("No open gemini.google.com/app/<id> tab found in Chrome CDP");
+    const data = await evalInTab(tab.webSocketDebuggerUrl, `(() => {
+      const m = location.pathname.match(/\\/app\\/([a-zA-Z0-9_-]+)/);
+      const sid = ${JSON.stringify(sidArg || "")}.replace(/^c_/, "") || (m ? m[1] : "");
+      const queries = Array.from(document.querySelectorAll("user-query")).map(e => (e.innerText || "").replace(/^You said\\s*\\n?/i, "").trim()).filter(Boolean);
+      const responses = Array.from(document.querySelectorAll("model-response")).map(e => (e.innerText || "").replace(/^Gemini said\\s*\\n?/i, "").trim()).filter(Boolean);
+      const turns = [];
+      const n = Math.max(queries.length, responses.length);
+      for (let i = 0; i < n; i++) {
+        if (i < queries.length) turns.push({role: "user", text: queries[i]});
+        if (i < responses.length) turns.push({role: "assistant", text: responses[i]});
+      }
+      return {session_id: sid, url: location.href, title: (document.title || "Google Gemini").replace(/\\s*-\\s*Google Gemini$/, "").trim(), turns};
+    })()`);
+    if (!data?.session_id || !data.turns?.length) throw new Error("Gemini Web tab returned no turns");
+    console.log(JSON.stringify(data));
   } else {
     throw new Error("Unsupported web fetch host: " + host);
   }
 })().catch(e => { console.error(e.message || e); process.exit(1); });
 """
-    if host == "gemini_web":
-        cmd = ["gemini-web-cli", "get", session_id] if session_id else ["gemini-web-cli", "list"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "gemini-web-cli unavailable")
-        raise RuntimeError("gemini_web sessions require --session-id with review-job or normalized transcript")
     proc = subprocess.run(["node", "-e", script, host, session_id or "", cdp_url], capture_output=True, text=True, timeout=25)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to fetch web session from shared Chrome CDP")
     data = json.loads(proc.stdout)
-    prompts = [t["text"] for t in data.get("turns", []) if t["role"] == "user" and real_prompt(t["text"])]
+    prompts = [t["text"] for t in data.get("turns", []) if t["role"] == "user" and not t["text"].strip().startswith(GUARDIAN_TAG) and real_prompt(t["text"])]
     last_asst = next((t["text"] for t in reversed(data.get("turns", [])) if t["role"] == "assistant"), "")
     evidence = [f"{t['role']}: {bounded(t['text'], 1600)}" for t in data.get("turns", [])[-10:]]
     return {
@@ -1911,7 +1964,8 @@ def main(argv=None):
                           "last_failure": retry.get("category")})
         print(json.dumps({"version": VERSION, "backend_chain": gates, "config_exists": args.config.is_file(), "script": str(Path(__file__).resolve()), "backend": cfg.get("backend", "openrouter"), "model": cfg["model"],
                           "policy_sha256": hashlib.sha256(policy_text().encode()).hexdigest(), "checkpoint_every": cfg["checkpoint_every"],
-                          "state_dir": str(args.state_dir), "idle_model_calls": 0, "scheduled_polling": False}))
+                          "state_dir": str(args.state_dir), "idle_model_calls": 0, "scheduled_polling": False,
+                          "watcher_installed": (Path.home() / "Library/LaunchAgents/com.sami.intent-guardian-watcher.plist").is_file()}))
         return 0
     if args.command == "status":
         states = []
@@ -1961,8 +2015,14 @@ def main(argv=None):
                 raise ValueError("Job review requires actual intent and an executor result")
             if not isinstance(proofs, list) or len(proofs) > 12 or not all(isinstance(p, str) for p in proofs):
                 raise ValueError("Job review evidence must be a short list of primary tool results")
+            session_url = event.get("session_url")
+            project = event.get("project")
             event = {"session_id": sid, "hook_event_name": "Stop", "last_assistant_message": result,
                      "_controller_job": {"prompt": prompt, "evidence": proofs, "delivery": event.get("delivery")}}
+            if isinstance(session_url, str) and session_url.strip():
+                event["_session_url"] = session_url.strip()[:500]
+            if isinstance(project, str) and project.strip():
+                event["_project_name"] = project.strip()[:80]
         elif args.command == "hook":
             event.pop("_controller_job", None)
             event.pop("_audit_through_line", None)
@@ -1973,7 +2033,7 @@ def main(argv=None):
                 output, state = process_event(event, args.host, cfg, Path(isolated), force=True)
         else:
             output, state = process_event(event, args.host, cfg, args.state_dir, force=args.command in {"audit", "audit-web"})
-        if args.command in {"review-job", "audit-web"} or (args.command == "hook" and state.get("last_event") in {"SessionStart", "PostInvocation", "Stop"}):
+        if args.command in {"review-job", "audit-web"} or (args.command == "audit" and args.through_line is None) or (args.command == "hook" and state.get("last_event") in {"SessionStart", "PostInvocation", "Stop"}):
             publish_feed(cfg, state)
         if args.command in {"audit", "audit-web", "review-job"}:
             print(json.dumps({"hook_output": output, "session_id": state.get("session_id"), "session_url": _session_url(args.host, state.get("session_id"), state), "status": state.get("status"), "last_review": state.get("last_review"), "pending": state.get("pending"), "last_resolution": state.get("last_resolution"), "model_error": state.get("model_error"),
