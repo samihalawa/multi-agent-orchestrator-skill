@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
@@ -1902,7 +1902,12 @@ function evalInTab(wsUrl, expression) {
     const data = await evalInTab(tab.webSocketDebuggerUrl, `(() => {
       const m = location.pathname.match(/\\/app\\/([a-zA-Z0-9_-]+)/);
       const sid = ${JSON.stringify(sidArg || "")}.replace(/^c_/, "") || (m ? m[1] : "");
-      const queries = Array.from(document.querySelectorAll("user-query")).map(e => (e.innerText || "").replace(/^You said\\s*\\n?/i, "").trim()).filter(Boolean);
+      const queries = Array.from(document.querySelectorAll("user-query")).map(e => {
+        const raw = (e.innerText || "").trim();
+        return /^You said /i.test(raw) && raw.includes("\\n\\n")
+          ? raw.slice(raw.indexOf("\\n\\n") + 2).trim()
+          : raw.replace(/^You said\\s*\\n?/i, "").trim();
+      }).filter(Boolean);
       const responses = Array.from(document.querySelectorAll("model-response")).map(e => (e.innerText || "").replace(/^Gemini said\\s*\\n?/i, "").trim()).filter(Boolean);
       const turns = [];
       const n = Math.max(queries.length, responses.length);
@@ -1923,7 +1928,7 @@ function evalInTab(wsUrl, expression) {
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to fetch web session from shared Chrome CDP")
     data = json.loads(proc.stdout)
-    prompts = [t["text"] for t in data.get("turns", []) if t["role"] == "user" and not t["text"].strip().startswith(GUARDIAN_TAG) and real_prompt(t["text"])]
+    prompts = [t["text"] for t in data.get("turns", []) if t["role"] == "user" and GUARDIAN_TAG not in t["text"] and real_prompt(t["text"])]
     last_asst = next((t["text"] for t in reversed(data.get("turns", [])) if t["role"] == "assistant"), "")
     evidence = [f"{t['role']}: {bounded(t['text'], 1600)}" for t in data.get("turns", [])[-10:]]
     return {

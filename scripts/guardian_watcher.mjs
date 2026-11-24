@@ -243,9 +243,13 @@ function parseWebTabUrl(url) {
 function extractGeminiTabFn() {
   const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Detener" i], .stop-icon, mat-progress-spinner');
   const streaming = !!(stopBtn && stopBtn.offsetParent !== null);
-  const queries = Array.from(document.querySelectorAll('user-query')).map((e) =>
-    (e.innerText || '').replace(/^You said\s*\n?/i, '').trim()
-  ).filter(Boolean);
+  const queries = Array.from(document.querySelectorAll('user-query')).map((e) => {
+    const raw = (e.innerText || '').trim();
+    if (/^You said /i.test(raw) && raw.includes('\n\n')) {
+      return raw.slice(raw.indexOf('\n\n') + 2).trim();
+    }
+    return raw.replace(/^You said\s*\n?/i, '').trim();
+  }).filter(Boolean);
   const responses = Array.from(document.querySelectorAll('model-response')).map((e) =>
     (e.innerText || '').replace(/^Gemini said\s*\n?/i, '').trim()
   ).filter(Boolean);
@@ -506,11 +510,11 @@ function sendCodexTurn(threadId, text) {
 
 function summarizeTurns(turns) {
   const cleanTurns = (turns || []).filter((t) => t && typeof t.text === 'string' && t.text.trim());
-  const humanPrompts = cleanTurns.filter((t) => t.role === 'user' && !t.text.trim().startsWith(GUARDIAN_TAG));
+  const humanPrompts = cleanTurns.filter((t) => t.role === 'user' && !t.text.includes(GUARDIAN_TAG));
   const lastAsst = [...cleanTurns].reverse().find((t) => t.role === 'assistant');
   if (!humanPrompts.length || !lastAsst) return null;
   const lastUserDigest = sha(humanPrompts[humanPrompts.length - 1].text.trim());
-  const turnDigest = sha([humanPrompts.length, lastUserDigest, lastAsst.text.trim()]);
+  const turnDigest = sha([lastUserDigest, lastAsst.text.trim()]);
   return { cleanTurns, humanPrompts, lastAsst, lastUserDigest, turnDigest };
 }
 
