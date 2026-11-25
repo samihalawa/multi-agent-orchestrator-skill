@@ -610,7 +610,7 @@ function clientApp() {
   function parseCorrectionParts(msg) {
     const clean = msg.replace(/^\[SAMI'S INTENT GUARDIAN\]\s*(?:DO NOT STOP[^\n]*\n)?/i, "").trim();
     const gap = (clean.match(/(?:^|\n)Gap:\s*([\s\S]*?)(?=\n(?:Execute now|Next action|Before finishing)|\nVerify|$)/i) || [])[1];
-    const exec = (clean.match(/(?:^|\n)(?:Execute now[^\n]*?:|Next action:)\s*([\s\S]*?)(?=\n(?:Verify[^\n]*:|Before finishing[^\n]*:)|$)/i) || [])[1];
+    const exec = (clean.match(/(?:^|\n)(?:Execute now(?:\s*\([^\n]*?\))?:|Next action:)\s*([\s\S]*?)(?=\n(?:Verify[^\n]*:|Before finishing[^\n]*:)|$)/i) || [])[1];
     const verify = (clean.match(/(?:^|\n)(?:Verify[^\n]*:|Before finishing[^\n]*:)\s*([\s\S]*)$/i) || [])[1];
     if (gap || exec || verify) return { gap, exec, verify };
     return null;
