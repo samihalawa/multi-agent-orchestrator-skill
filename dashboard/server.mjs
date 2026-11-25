@@ -352,6 +352,7 @@ function clientApp() {
   };
   const HOST_ORDER = ["codex", "claude", "antigravity", "chatgpt", "claude_ai", "gemini_web", "grokbot", "cowork"];
   const CATEGORY_LABELS = {
+    prior_insistence: "Prior Insistence Missed",
     sibling_sweep: "Sibling Sweep",
     live_verification: "Live Runtime Proof",
     scope_coverage: "Full Coverage",

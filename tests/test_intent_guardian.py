@@ -1006,6 +1006,57 @@ class GuardianContracts(unittest.TestCase):
         self.assertTrue(any(e["kind"] == "manual_followup" and "[sibling_sweep]" in e["message"] for e in evts))
         self.assertEqual(evts[0]["project"], "整理健康建议")
 
+    def test_bash_input_and_automation_not_counted_as_manual_followup(self):
+        state_dir = self.root / "state"
+        _, state = g.process_event({
+            "session_id": "noise-filter-1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Half done.",
+            "_controller_job": {"prompt": "Finish all work", "evidence": ["partial"]},
+        }, "codex", self.cfg, state_dir, reviewer=lambda c, p: (
+            {"intervene": True, "verdict_domain": "closure", "reason": "Incomplete.",
+             "next_action": "Finish rest.", "proof_needed": "Readback.", "evidence_ids": [p["evidence"][-1]["id"]]},
+            {"usage": {}},
+        ))
+        self.assertEqual(state["interventions"], 1)
+        self.assertFalse(g.real_prompt("<bash-input>ls -la</bash-input>"))
+        _, state = g.process_event({
+            "session_id": "noise-filter-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Automation: TENDERLOOP\nAutomation ID: tenderloop-1\nRun job",
+        }, "codex", self.cfg, state_dir)
+        self.assertEqual(state.get("manual_followups", []), [])
+
+    def test_prior_insistence_category_and_antigravity_session_start_reminder(self):
+        state_dir = self.root / "state"
+        # Non-subagent Antigravity SessionStart injects first-step reminder once with 0 model calls
+        out1, st1 = g.process_event({
+            "conversationId": "agy-first-1",
+            "hookEventName": "SessionStart",
+        }, "antigravity", self.cfg, state_dir, reviewer=lambda c, p: self.fail("SessionStart must not invoke model"))
+        self.assertIn("MANDATORY FIRST STEP", out1["injectSteps"][0]["systemMessage"]["systemMessage"])
+        self.assertTrue(st1["first_step_reminded"])
+        out2, _ = g.process_event({
+            "conversationId": "agy-first-1",
+            "hookEventName": "SessionStart",
+        }, "antigravity", self.cfg, state_dir, reviewer=lambda c, p: self.fail("SessionStart must not invoke model"))
+        self.assertEqual(out2, {})
+
+        # Subagent Antigravity SessionStart never injects
+        sub_tr = self.root / "agy-sub-first.jsonl"
+        sub_tr.write_text(json.dumps({
+            "step_index": 1, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+            "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-25T09:00:00Z sender=05002099-f578-4b01-a50c-fd566c350000\nSubtask\n</SYSTEM_MESSAGE>",
+        }) + "\n")
+        out_sub, st_sub = g.process_event({
+            "conversationId": "agy-sub-first",
+            "transcriptPath": str(sub_tr),
+            "hookEventName": "SessionStart",
+        }, "antigravity", self.cfg, state_dir)
+        self.assertEqual(out_sub, {})
+        self.assertTrue(st_sub["subagent"])
+        self.assertEqual(g.classify_manual_followup("Always check my previous memory insistences and exclude those!"), "prior_insistence")
+
 
 if __name__ == "__main__":
     unittest.main()

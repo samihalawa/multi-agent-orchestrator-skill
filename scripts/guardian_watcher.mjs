@@ -41,7 +41,7 @@ const ONCE = ARGS.has('--once');
 const NO_DELIVER = ARGS.has('--no-deliver');
 const SEED_ONLY = ARGS.has('--seed-only');
 
-const WATCHER_VERSION = '1.8.0';
+const WATCHER_VERSION = '1.8.1';
 const GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]";
 const DEFAULT_INTERVAL_MS = 15_000;
 const STABLE_MS = 10_000;

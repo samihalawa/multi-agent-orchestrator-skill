@@ -23,8 +23,16 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
+PRIOR_INSISTENCE_REMINDER = (
+    "[MANDATORY FIRST STEP — EVERY TASK & SUBTASK]\n"
+    "Before planning, filtering, generating, or spawning subtasks, run a super-fast parallel check of "
+    "Sami's previous insistences in ~/.codex/memories/ (MEMORY.md, memory_summary.md, rollout_summaries/, extensions/chronicle/) "
+    "and relevant prior conversations across all 7 platforms (~/.codex/sessions, ~/.claude/projects, ~/.gemini/antigravity/brain, "
+    "web chats via seven-platform-chat-cli) plus AI_REPORTS_MASTER. Extract all INCLUDE / EXCLUDE / PRIORITY rules "
+    "and pass them into every subtask/subagent."
+)
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path.home() / ".config/intent-guardian/config.json"
 LEARNED_PATTERNS = DEFAULT_CONFIG.with_name("learned-patterns.json")
@@ -34,7 +42,7 @@ OBSERVE_EVENTS = {"SessionStart", "UserPromptSubmit", "PostCompact", "PreInvocat
 REVIEW_EVENTS = {"Stop", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostInvocation"}
 NOISE_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<system-reminder>",
                   "<task-notification>", "This session is being continued from a previous conversation",
-                  "<local-command-", "<command-name>")
+                  "<local-command-", "<command-name>", "<bash-input>", "<bash-stdout>")
 # Stored evidence is generous; each backend receives the newest slice that fits
 # its own context budget, so large-context judges read the conversation fully.
 STORE_RECORDS, STORE_CHARS = 240, 240000
@@ -69,6 +77,13 @@ sample, draft, plan, export, or local build for the real user/provider outcome.
 Event semantics: `Stop` means the executing agent proposes to end its turn, NEVER a human
 stop. Human cancellation requires explicit owner words or an `Interrupt` event.
 Intervene ONLY for a concrete, evidenced defect needing correction NOW:
+- CHECK #1 (HIGHEST PRIORITY) — missing prior-insistences check: before planning, filtering,
+  generating, or closing any substantive task or subtask, verify whether the executor checked
+  Sami's previous insistences in memory (`~/.codex/memories/`) and relevant prior conversations
+  and honored explicit INCLUDE / EXCLUDE / PRIORITY rules across the task and all subtasks.
+  If a substantive deliverable/report/briefing/cleanup skipped memory/prior-history lookup or
+  dropped known constraints, intervene immediately as the FIRST correction (skip only trivial
+  1-step commands, factual Q&A, active background waits, or evidence already showing lookup);
 - shrinking scope, omitting `done X of N` across requested platforms/sources/items, or fixing
   only one instance while leaving visible siblings of the same failure class unaddressed;
 - avoidable owner question, confirmation, choice, or handoff (`wrap_up`, `ask_question`,
@@ -164,6 +179,8 @@ def classify_prompt(text):
         return "task_request", text
     if text.startswith("<skill>") and text.endswith("</skill>"):
         return "tool", text
+    if text.startswith("Automation:") and "Automation ID:" in text[:300]:
+        return "task_request", text
     return "user", text
 
 
@@ -369,6 +386,8 @@ def backfill_inventories(state, host):
 def classify_manual_followup(text):
     """Categorize a human message arriving after Guardian already intervened."""
     t = (text or "").strip()
+    if re.search(r"\b(?:previous|previo|previa|memoria|memory|insist\w*|prioriz\w*|no solo|ya te dije|already told|includ\w*|exclud\w*|como siempre|always check)\b", t, re.I):
+        return "prior_insistence"
     if re.search(r"/address-all-similar-instances-skill|/dont-limit-skill|\b(?:remove|fix|update|clean|do)\s+(?:those|them|all)\s+too\b|\ball\s+(?:similar|remaining|other)\b", t, re.I) or (len(t) <= 80 and re.search(r"\bmore\b", t, re.I)):
         return "sibling_sweep"
     if re.search(r"\b(?:is (?:it|ti) work\w*|all work\w*|run every|test it|actually work\w*|what was achieved|verified\?)\b", t, re.I):
@@ -1758,6 +1777,16 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                 state["failed_hash"], state["failure_at"] = content_hash, time.time()
                 state["model_failures"] = state.get("model_failures", 0) + 1
                 why = "model unavailable; host continues"
+        if (
+            not output
+            and host == "antigravity"
+            and name == "SessionStart"
+            and not state.get("subagent")
+            and not state.get("first_step_reminded")
+            and os.environ.get("INTENT_GUARDIAN_OBSERVER") != "1"
+        ):
+            state["first_step_reminded"] = True
+            output = {"injectSteps": [{"systemMessage": {"systemMessage": PRIOR_INSISTENCE_REMINDER}}]}
         state["status"] = why
         atomic_save(state_path, state)
         return output, state
