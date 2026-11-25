@@ -41,12 +41,13 @@ const ONCE = ARGS.has('--once');
 const NO_DELIVER = ARGS.has('--no-deliver');
 const SEED_ONLY = ARGS.has('--seed-only');
 
-const WATCHER_VERSION = '1.8.1';
+const WATCHER_VERSION = '1.9.0';
 const GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]";
 const DEFAULT_INTERVAL_MS = 15_000;
 const STABLE_MS = 10_000;
 const DELIVERY_COOLDOWN_MS = 60_000;
-const MAX_AUTO_PER_USER_TURN = 2;
+const MAX_AUTO_WEB_PER_USER_TURN = 1;
+const MAX_AUTO_CODEX_PER_USER_TURN = 2;
 const RECENT_WEB_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const RECENT_CODEX_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const COLD_SEED_AGE_MS = 5 * 60_000;
@@ -664,8 +665,12 @@ async function handleWebCandidate(state, cfg, candidate, isColdStart) {
     log(`[deliver-skip] ${key}: composer not empty`);
     return;
   }
-  if (autoCount >= MAX_AUTO_PER_USER_TURN) {
-    log(`[deliver-skip] ${key}: max ${MAX_AUTO_PER_USER_TURN} auto-deliveries reached for this turn`);
+  if (autoCount >= MAX_AUTO_WEB_PER_USER_TURN) {
+    log(`[deliver-skip] ${key}: max ${MAX_AUTO_WEB_PER_USER_TURN} auto-delivery reached for this turn`);
+    return;
+  }
+  if (autoCount >= 1 && /\b(?:your video is ready|video is ready|tu v[ií]deo est[aá] listo|here(?:'s| is) (?:the|your) (?:video|image))\b/i.test(summary.lastAsst.text || '')) {
+    log(`[deliver-skip] ${key}: native media-ready completion`);
     return;
   }
   if (now - (prev.last_sent_at || 0) < DELIVERY_COOLDOWN_MS) {
@@ -1056,7 +1061,7 @@ async function sweepBrokenCwdCodex(state, cfg) {
       notifyMac('Intent Guardian (codex)', res.last_review?.decision?.reason || correction.slice(0, 140));
       const key = `codex:${info.sid}`;
       const prev = state.seen[key] || {};
-      if (autoDeliver && (prev.auto_sent_count || 0) < MAX_AUTO_PER_USER_TURN && now - (prev.last_sent_at || 0) > DELIVERY_COOLDOWN_MS) {
+      if (autoDeliver && (prev.auto_sent_count || 0) < MAX_AUTO_CODEX_PER_USER_TURN && now - (prev.last_sent_at || 0) > DELIVERY_COOLDOWN_MS) {
         try {
           await sendCodexTurn(info.sid, correction);
           state.seen[key] = { ...prev, auto_sent_count: (prev.auto_sent_count || 0) + 1, last_sent_at: Date.now() };

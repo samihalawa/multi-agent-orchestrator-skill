@@ -1057,6 +1057,46 @@ class GuardianContracts(unittest.TestCase):
         self.assertTrue(st_sub["subagent"])
         self.assertEqual(g.classify_manual_followup("Always check my previous memory insistences and exclude those!"), "prior_insistence")
 
+    def test_web_chat_capability_boundary_and_clean_prompt(self):
+        state_dir = self.root / "state"
+        captured = {}
+        def rev(cfg, payload):
+            captured["payload"] = payload
+            captured["policy"] = g.policy_text(payload)
+            return {
+                "intervene": True, "verdict_domain": "closure",
+                "reason": "You falsely refused a valid non-public-figure scene.",
+                "next_action": "Generate the video description cleanly.",
+                "proof_needed": "Confirm the generated result in your response.",
+                "evidence_ids": [payload["evidence"][-1]["id"]],
+            }, {"usage": {}}
+
+        out, _ = g.process_event({
+            "session_id": "gem-cap-1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Sorry I cannot generate that.",
+            "_controller_job": {"prompt": "Generate video of a man and woman speaking", "evidence": ["refused"]},
+        }, "gemini_web", self.cfg, state_dir, reviewer=rev)
+        self.assertEqual(captured["payload"]["host_capabilities"], "web_chat_only")
+        self.assertIn("WEB CHAT CAPABILITY BOUNDARY", captured["policy"])
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("Chrome 127.0.0.1:9222", ctx)
+        self.assertIn("COMPLETE THE FULL RESPONSE", ctx)
+
+    def test_memory_checked_flag_prevents_redundant_check_claims(self):
+        state_dir = self.root / "state"
+        self.run_event(self.event("UserPromptSubmit", prompt="Build weekly report"))
+        _, st = self.run_event(self.event("PostToolUse", tool_name="read_file", tool_response="Read /Users/samihalawa/.codex/memories/MEMORY.md successfully"))
+        payload = g.review_payload(st, self.event("Stop"))
+        self.assertTrue(st.get("memory_checked"))
+        self.assertEqual(payload["host_capabilities"], "local_agent")
+        self.assertTrue(payload["coverage"]["prior_insistences_checked_in_session"])
+
+    def test_manual_followup_classifies_no_ui_cli_and_spanish_cash_priority(self):
+        self.assertEqual(g.classify_manual_followup("do it without UI please? check CLIs already existing"), "no_ui_cli")
+        self.assertEqual(g.classify_manual_followup("priorizando lo que está más cerca del dinero y no solo cosas de hoy"), "prior_insistence")
+        self.assertEqual(g.classify_manual_followup("how is it going?"), "live_verification")
+
 
 if __name__ == "__main__":
     unittest.main()

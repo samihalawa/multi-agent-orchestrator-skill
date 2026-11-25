@@ -23,8 +23,14 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
+WEB_HOSTS = {"chatgpt", "claude_ai", "gemini_web", "grokbot"}
+MEMORY_CHECK_RE = re.compile(
+    r"(?i)(?:\.codex/memories|MEMORY\.md|memory_summary\.md|rollout_summaries|"
+    r"extensions/chronicle|extensions/skysight|seven-platform-chat-cli|"
+    r"conversation_summaries\.db|AI_REPORTS_MASTER|supercontext-use-quietly)"
+)
 PRIOR_INSISTENCE_REMINDER = (
     "[MANDATORY FIRST STEP — EVERY TASK & SUBTASK]\n"
     "Before planning, filtering, generating, or spawning subtasks, run a super-fast parallel check of "
@@ -77,13 +83,19 @@ sample, draft, plan, export, or local build for the real user/provider outcome.
 Event semantics: `Stop` means the executing agent proposes to end its turn, NEVER a human
 stop. Human cancellation requires explicit owner words or an `Interrupt` event.
 Intervene ONLY for a concrete, evidenced defect needing correction NOW:
-- CHECK #1 (HIGHEST PRIORITY) — missing prior-insistences check: before planning, filtering,
-  generating, or closing any substantive task or subtask, verify whether the executor checked
-  Sami's previous insistences in memory (`~/.codex/memories/`) and relevant prior conversations
-  and honored explicit INCLUDE / EXCLUDE / PRIORITY rules across the task and all subtasks.
-  If a substantive deliverable/report/briefing/cleanup skipped memory/prior-history lookup or
-  dropped known constraints, intervene immediately as the FIRST correction (skip only trivial
-  1-step commands, factual Q&A, active background waits, or evidence already showing lookup);
+- CHECK #1 (LOCAL AGENTS ONLY, when `coverage.prior_insistences_checked_in_session` is false):
+  before planning, filtering, generating, or closing any substantive task or subtask on a local
+  agent (`codex`/`claude`/`antigravity`/`cowork`), verify memory (`~/.codex/memories/`) or prior
+  conversations were checked and explicit INCLUDE / EXCLUDE / PRIORITY rules (e.g. closeness to
+  cash/money; active prior-day items, not just today) were applied across the task & all subtasks.
+  Once `coverage.prior_insistences_checked_in_session` is true, do NOT re-intervene claiming
+  memory wasn't checked unless a concrete constraint was actually violated;
+- programmatic / CLI-first & anti-tunnel-vision: intercept manual UI/screenshot workarounds when
+  a maintained CLI/API/DB/library route exists, or blindly repeating an old method instead of a
+  better current route/library;
+- status-only recaps, stalls, & unverified user-facing state: intercept recaps that leave the
+  owner reconstructing state without next verifiable outcome/dependency, post-compaction stalls,
+  or "fixed" UI/behavior claims not verified on real reopen/reload;
 - shrinking scope, omitting `done X of N` across requested platforms/sources/items, or fixing
   only one instance while leaving visible siblings of the same failure class unaddressed;
 - avoidable owner question, confirmation, choice, or handoff (`wrap_up`, `ask_question`,
@@ -386,11 +398,13 @@ def backfill_inventories(state, host):
 def classify_manual_followup(text):
     """Categorize a human message arriving after Guardian already intervened."""
     t = (text or "").strip()
-    if re.search(r"\b(?:previous|previo|previa|memoria|memory|insist\w*|prioriz\w*|no solo|ya te dije|already told|includ\w*|exclud\w*|como siempre|always check)\b", t, re.I):
+    if re.search(r"\b(?:without ui|wihtotu ui|no ui|avoid ui|check clis?|use (?:a )?cli|programmat\w*)\b", t, re.I):
+        return "no_ui_cli"
+    if re.search(r"\b(?:previous|previo|previa|memoria|memory|insist\w*|prioriz\w*|cerca del dinero|no solo|ya te dije|already told|includ\w*|exclud\w*|como siempre|always check)\b", t, re.I):
         return "prior_insistence"
     if re.search(r"/address-all-similar-instances-skill|/dont-limit-skill|\b(?:remove|fix|update|clean|do)\s+(?:those|them|all)\s+too\b|\ball\s+(?:similar|remaining|other)\b", t, re.I) or (len(t) <= 80 and re.search(r"\bmore\b", t, re.I)):
         return "sibling_sweep"
-    if re.search(r"\b(?:is (?:it|ti) work\w*|all work\w*|run every|test it|actually work\w*|what was achieved|verified\?)\b", t, re.I):
+    if re.search(r"\b(?:is (?:it|ti) work\w*|all work\w*|run every|test it|actually work\w*|what was achieved|verified\?|how is (?:it going|oong)|still shows|why sitlsl shwos|u sure\?)\b", t, re.I):
         return "live_verification"
     if re.search(r"numbered-coverage-auditor|seven-platform-chat-cli|\b(?:absolutely all|all platforms|all seven|multipage|more complete|check all)\b", t, re.I):
         return "scope_coverage"
@@ -412,6 +426,8 @@ def add_evidence(state, kind, text, source_id):
     if kind == "task_request":
         if any(e["kind"] in {"user", "task_request"} and e["text"] == text for e in state["intent"]):
             return
+    if kind in {"action", "tool"} and MEMORY_CHECK_RE.search(text):
+        state["memory_checked"] = True
     source_id = "e:" + str(source_id)
     if kind == "tool":
         pin_inventory(state, text, source_id)
@@ -730,12 +746,15 @@ def review_payload(state, event, budget=None):
                     "executor_message_id": proposed_id or latest_evidence.get("assistant"),
                     "executor_action_id": latest_evidence.get("action"),
                     "latest_tool_result_id": latest_evidence.get("tool")}
-    return {"event": name, "event_semantics": meaning, "executor_proposed_final_stop": name == "Stop", "review_phase": "closure" if name == "Stop" else "active_route", "session_id": state["session_id"],
+    return {"event": name, "event_semantics": meaning, "host": state["host"],
+            "host_capabilities": "web_chat_only" if state["host"] in WEB_HOSTS else "local_agent",
+            "executor_proposed_final_stop": name == "Stop", "review_phase": "closure" if name == "Stop" else "active_route", "session_id": state["session_id"],
             "review_focus": review_focus,
             "native_background_tasks": background_tasks,
             "intent": state["intent"], "prior_state_delta": state["state_delta"],
             "pending_correction": state.get("pending"), "evidence": evidence,
             "coverage": {"transcript_lines_parsed": state["line"], "malformed": state["malformed_lines"],
+                         "prior_insistences_checked_in_session": bool(state.get("memory_checked")),
                          "recent_evidence_records": len(recent), "pinned_inventory_records": len(pinned), "bounded_recent_evidence": True,
                          "explicit_audit_focus_lines": state.get("audit_focus_lines"),
                          "older_intent_in_delta_or_transcript": state.get("older_intent_in_delta_or_transcript", False),
@@ -773,6 +792,15 @@ def policy_text(payload=None):
     if payload and payload.get("coverage", {}).get("explicit_audit_focus_lines"):
         policy += ("\nHistorical evidence IDs beginning with e:line: are valid citations. Copy the complete id field exactly, "
                    "including the final kind. Compare separately the required record content and the existence of the record or archive.")
+    if payload and payload.get("host_capabilities") == "web_chat_only":
+        policy += """\nWEB CHAT CAPABILITY BOUNDARY (OVERRIDES LOCAL-AGENT CHECKS):
+This session runs inside a consumer web chat (ChatGPT / Claude.ai / Gemini Web / Grok) with
+NO local filesystem, NO ~/.codex/memories/, NO shell/CLI/op/SSH/Chrome CDP, and NO ability
+to inspect pixels or playback of generated images/videos.
+- NEVER ask this web chat to check ~/.codex/memories/, run local commands, or inspect video/image pixels.
+- Once a web chat delivers a complete text answer or a native media-ready notice (e.g. generated video/image ready), STOP QUIETLY (intervene: false).
+- Intervene ONLY for clear in-chat defects: false refusal, truncated/partial answer, ignored constraints stated in THIS chat, or avoidable clarification questions.
+"""
     if payload is not None and payload.get("event") != "Stop":
         policy += """\nPHASE ISOLATION — ACTIVE TASK CHECKPOINT, NOT FINAL CLOSURE.
 Review ONLY a presently evidenced route/scope contradiction, lost context/work,
@@ -1130,13 +1158,22 @@ def validate_decision(decision, payload):
 
 
 def emit_correction(event, decision, host="codex"):
-    correction = (
-        GUARDIAN_TAG + " DO NOT STOP — COMPLETE THE FULL REMAINING OBJECTIVE IN ONE PASS.\n"
-        "Gap: " + bounded(decision["reason"], 650) + "\n"
-        "Execute now (finish ALL remaining items & siblings in parallel batches; resolve routine choices yourself, zero permission/context questions, and pivot via CLI/API/op/Chrome 127.0.0.1:9222 if a route fails): "
-        + bounded(decision["next_action"], 1100) + "\n"
-        "Verify at primary source before closing: " + bounded(decision["proof_needed"], 650)
-    )
+    if host in WEB_HOSTS:
+        correction = (
+            GUARDIAN_TAG + " DO NOT STOP — COMPLETE THE FULL RESPONSE IN ONE PASS.\n"
+            "Gap: " + bounded(decision["reason"], 650) + "\n"
+            "Execute now (complete the full answer cleanly in one pass without unnecessary refusals or clarification questions): "
+            + bounded(decision["next_action"], 1100) + "\n"
+            "Before finishing, verify directly in your response: " + bounded(decision["proof_needed"], 650)
+        )
+    else:
+        correction = (
+            GUARDIAN_TAG + " DO NOT STOP — COMPLETE THE FULL REMAINING OBJECTIVE IN ONE PASS.\n"
+            "Gap: " + bounded(decision["reason"], 650) + "\n"
+            "Execute now (finish ALL remaining items & siblings in parallel batches; resolve routine choices yourself, zero permission/context questions, and pivot via CLI/API/op/Chrome 127.0.0.1:9222 if a route fails): "
+            + bounded(decision["next_action"], 1100) + "\n"
+            "Verify at primary source before closing: " + bounded(decision["proof_needed"], 650)
+        )
     if host == "antigravity":
         if event == "Stop":
             return {"decision": "continue", "reason": correction}
@@ -1393,7 +1430,7 @@ def run_review_chain(cfg, state_dir, state, event, reviewer):
             cooling.append({"backend": entry.get("backend"), **retry})
             attempts.append({"backend": entry.get("backend"), "skipped": "cooling down", "category": retry.get("category")})
             continue
-        payload = review_payload(state, event, entry.get("evidence_chars", 24000))
+        payload = review_payload(state, event, entry.get("evidence_chars", 48000))
         try:
             decision, metrics = reviewer({**entry, "request_timeout": timeout}, payload)
             if reviewer is call_model and decision.get("intervene") and any(
@@ -2040,7 +2077,7 @@ def main(argv=None):
             except (OSError, ValueError):
                 retry = {}
             gates.append({"backend": entry.get("backend"), "model": entry.get("model"),
-                          "evidence_chars": entry.get("evidence_chars", 24000),
+                          "evidence_chars": entry.get("evidence_chars", 48000),
                           "cooling_until": retry.get("retry_at") if retry.get("retry_at", 0) > time.time() else None,
                           "last_failure": retry.get("category")})
         print(json.dumps({"version": VERSION, "backend_chain": gates, "config_exists": args.config.is_file(), "script": str(Path(__file__).resolve()), "backend": cfg.get("backend", "openrouter"), "model": cfg["model"],
