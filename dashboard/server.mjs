@@ -75,7 +75,7 @@ function normalize(event, importing = false) {
       typeof event.at !== "number" || !Number.isFinite(event.at) ||
       event.at < 0 || event.at > Date.now() / 1000 + 900) return null;
   if (event.message != null && typeof event.message !== "string") return null;
-  if (event.outcome != null && !["verified", "superseded", "pending"].includes(event.outcome)) return null;
+  if (event.outcome != null && !["verified", "superseded", "redirected", "pending"].includes(event.outcome)) return null;
   const project = typeof event.project === "string"
     ? event.project.replace(/[^\p{L}\p{N} .@+\-_:/()–—]/gu, "").trim().slice(0, 80) || null
     : null;
@@ -196,7 +196,12 @@ function queryState(database) {
   const seenRows = database.prepare(`
     SELECT host, session_id, MAX(at) AS last_at,
       MAX(project) AS project,
-      MAX(title) AS title,
+      COALESCE(
+        (SELECT t.title FROM events t
+          WHERE t.host = events.host AND t.session_id = events.session_id AND t.title IS NOT NULL
+          ORDER BY t.at DESC LIMIT 1),
+        MAX(title)
+      ) AS title,
       MAX(session_url) AS session_url,
       (SELECT s2.session_state FROM events s2
         WHERE s2.host = events.host AND s2.session_id = events.session_id AND s2.session_state IS NOT NULL
@@ -208,9 +213,10 @@ function queryState(database) {
       SUM(CASE WHEN kind IN ('turn_user', 'turn_assistant') THEN 1 ELSE 0 END) AS turn_count
     FROM events
     GROUP BY host, session_id
+    HAVING corrections_count > 0 OR manual_count > 0 OR error_count > 0 OR turn_count > 0 OR MAX(at) >= ?
     ORDER BY last_at DESC
     LIMIT 250
-  `).all();
+  `).all(now - 86400);
   const detailRows = database.prepare(`
     SELECT id, host, session_id, kind, at, message, outcome, project, session_url, session_state, title
     FROM events
@@ -242,6 +248,7 @@ function queryState(database) {
       delivered: 0,
       verified: 0,
       superseded: 0,
+      redirected: 0,
       pending: 0,
       errors: 0,
       manual_followups: 0,
@@ -259,10 +266,12 @@ function queryState(database) {
     delivered: 0,
     verified: 0,
     superseded: 0,
+    redirected: 0,
     pending: 0,
     errors: 0,
     manual_followups: 0,
-    last_24h: { corrections: 0, delivered: 0, verified: 0, superseded: 0, errors: 0, manual_followups: 0 },
+    median_resolution_sec: null,
+    last_24h: { corrections: 0, delivered: 0, verified: 0, superseded: 0, redirected: 0, errors: 0, manual_followups: 0 },
   };
   totals.sessions = Object.values(perHost).reduce((a, b) => a + b.sessions, 0);
 
@@ -290,6 +299,10 @@ function queryState(database) {
         totals.superseded += c;
         totals.last_24h.superseded += c24;
         if (h) h.superseded += c;
+      } else if (r.outcome === "redirected") {
+        totals.redirected += c;
+        totals.last_24h.redirected += c24;
+        if (h) h.redirected += c;
       } else if (r.outcome === "pending") {
         totals.pending += c;
         if (h) h.pending += c;
@@ -307,6 +320,27 @@ function queryState(database) {
       totals.last_24h.manual_followups += c24;
       if (h) h.manual_followups += c;
     }
+  }
+
+  const resTimes = database.prepare(`
+    SELECT (o.at - c.at) AS dt
+    FROM events c
+    JOIN events o
+      ON o.host = c.host
+     AND o.session_id = c.session_id
+     AND o.kind = 'outcome'
+     AND o.outcome = 'verified'
+     AND o.message = c.message
+     AND o.at >= c.at
+    WHERE c.kind = 'correction'
+    ORDER BY dt ASC
+    LIMIT 500
+  `).all().map((r) => Number(r.dt)).filter((x) => Number.isFinite(x) && x >= 0);
+  if (resTimes.length) {
+    const mid = Math.floor(resTimes.length / 2);
+    totals.median_resolution_sec = Math.round(
+      resTimes.length % 2 ? resTimes[mid] : (resTimes[mid - 1] + resTimes[mid]) / 2
+    );
   }
 
   const manualRows = database.prepare(`
@@ -397,6 +431,29 @@ function clientApp() {
   let fScope = "prompted", fHost = "all", fState = "all", fProject = "all";
   let selKey = null, selIdx = -1, viewMode = "session", chatMode = "prompts";
   const sessionCache = new Map();
+  const expandedCards = new Set();
+  const collapsedCards = new Set();
+  let expandAllCards = false;
+  let themeMode = "auto";
+  try { themeMode = localStorage.getItem("ig_theme") || "auto"; } catch {}
+
+  const applyTheme = () => {
+    const root = document.documentElement;
+    if (themeMode === "dark" || themeMode === "light") root.dataset.theme = themeMode;
+    else delete root.dataset.theme;
+    const btn = $("themeBtn");
+    if (btn) btn.textContent = themeMode === "dark" ? "Dark" : themeMode === "light" ? "Light" : "Auto";
+  };
+  const fmtDuration = (sec) => {
+    if (sec == null || !Number.isFinite(sec)) return "—";
+    if (sec < 60) return `${Math.round(sec)}s`;
+    if (sec < 3600) {
+      const m = Math.floor(sec / 60);
+      const s = Math.round(sec % 60);
+      return s ? `${m}m ${s}s` : `${m}m`;
+    }
+    return `${Math.round(sec / 360) / 10}h`;
+  };
 
   const relTime = (ts) => {
     if (!ts) return "";
@@ -579,12 +636,15 @@ function clientApp() {
     sb.className = "status live";
     sb.lastElementChild.textContent = `Live · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${sessions.length} sessions · ${ongoingN} ongoing${pendingN ? " · " + pendingN + " action" : ""}`;
 
-    const needs = filtered.filter((s) => s.status === "pending" || s.status === "error");
+    const activeNow = state.serverTime || Date.now() / 1000;
+    const needsActive = filtered.filter((s) => (s.status === "pending" || s.status === "error") && (activeNow - (s.last_at || 0)) < 21600);
     const active = filtered.filter((s) => s.status === "ongoing");
-    const rest = filtered.filter((s) => !needs.includes(s) && !active.includes(s));
+    const needsOlder = filtered.filter((s) => (s.status === "pending" || s.status === "error") && (activeNow - (s.last_at || 0)) >= 21600);
+    const rest = filtered.filter((s) => !needsActive.includes(s) && !active.includes(s) && !needsOlder.includes(s));
     const groups = [
-      ["Needs Attention", needs],
+      ["Needs Action (Active)", needsActive],
       ["Ongoing", active],
+      ["Older Open (>6h)", needsOlder],
       ["Completed & Recent", rest],
     ].filter(([, arr]) => arr.length);
     filtered = groups.flatMap(([, arr]) => arr);
@@ -593,6 +653,10 @@ function clientApp() {
       ? groups.map(([name, arr]) => `<div class="sec">${esc(name)} · ${arr.length}</div><div class="group">${arr.map((s) => rowHtml(s, idx++)).join("")}</div>`).join("")
       : '<div class="empty">No matching sessions. Try switching to "All Monitored".</div>';
 
+    if (arguments[0] === true) {
+      document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
+      return;
+    }
     if (viewMode === "overview" && isWide()) {
       renderOverview(false);
     } else if (selKey) {
@@ -600,7 +664,7 @@ function clientApp() {
       if (k >= 0) {
         selIdx = k;
         renderDetail(false);
-        if (chatMode === "all") fetchSessionDetail(filtered[k], false);
+        fetchSessionDetail(filtered[k], false);
       }
     } else if (isWide() && filtered.length) {
       openAt(0);
@@ -627,26 +691,33 @@ function clientApp() {
       }
     }
     const items = [];
+    const totalPrompts = sorted.filter((e) => e.kind === "correction").length;
     let promptNum = 0;
     const manualList = sorted.filter((e) => e.kind === "manual_followup");
     for (const ev of sorted) {
       if (ev.kind === "delivered" || ev.kind === "outcome") continue;
-      if (!showAllMessages && (ev.kind === "turn_user" || ev.kind === "turn_assistant")) continue;
+      if (!showAllMessages && (ev.kind === "turn_user" || ev.kind === "turn_assistant" || ev.kind === "manual_followup")) continue;
       if (ev.kind === "correction") {
         promptNum += 1;
-        const finOutcome = outcomeByMsg.get(ev.message)?.status || ev.outcome || "pending";
+        const outRec = outcomeByMsg.get(ev.message);
+        const finOutcome = outRec?.status || ev.outcome || "pending";
+        const turnaroundSec = (finOutcome === "verified" && outRec?.at && ev.at && outRec.at >= ev.at)
+          ? Math.round(outRec.at - ev.at)
+          : null;
         items.push({
           ...ev,
           _promptNum: promptNum,
+          _totalPrompts: totalPrompts,
           _delivered: ev.message ? deliveredMsgs.has(ev.message) : false,
           _outcome: finOutcome,
+          _turnaroundSec: turnaroundSec,
         });
         continue;
       }
       if (ev.kind === "turn_user") {
         // Avoid duplicating a turn_user right next to the matching manual_followup snippet
         const msgNorm = (ev.message || "").slice(0, 60);
-        const dupManual = manualList.some((m) => Math.abs((m.at || 0) - (ev.at || 0)) < 8 && (m.message || "").includes(msgNorm.slice(0, 25)));
+        const dupManual = manualList.some((m) => Math.abs((m.at || 0) - (ev.at || 0)) < 10 && (m.message || "").includes(msgNorm.slice(0, 25)));
         if (dupManual) continue;
       }
       items.push(ev);
@@ -654,7 +725,7 @@ function clientApp() {
     return items;
   }
 
-  function timelineItemHtml(ev, idx) {
+  function timelineItemHtml(ev, idx, sessionKey) {
     if (ev.kind === "turn_user") {
       return `<div class="chat-row me"><div class="bubble me"><div class="b-head"><strong>You</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div></div>`;
     }
@@ -671,12 +742,23 @@ function clientApp() {
       const stCls = ev._outcome === "verified" ? "st-completed" : ev._outcome === "pending" ? "st-pending" : "st-stopped";
       const delivPill = ev._delivered ? '<span class="badge-pill st-completed">✓ Delivered</span>' : "";
       const outPill = `<span class="badge-pill ${stCls}">${esc(ev._outcome)}</span>`;
+      const turnPill = ev._turnaroundSec != null ? `<span class="tag">resolved in ${esc(fmtDuration(ev._turnaroundSec))}</span>` : "";
       const parts = ev.message ? parseCorrectionParts(ev.message) : null;
-      const body = parts
-        ? `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div>`
-        : `<div class="ev-body">${esc(ev.message)}</div>`;
+      const cardId = `${sessionKey}:${ev.id || idx}`;
+      const defaultOpen = ev._outcome === "pending" || ev._promptNum === ev._totalPrompts;
+      const isOpen = expandAllCards || (!collapsedCards.has(cardId) && (expandedCards.has(cardId) || defaultOpen));
+      let body;
+      if (parts) {
+        const hasMore = Boolean(parts.exec || parts.verify);
+        const moreHtml = hasMore
+          ? `<details class="ev-more" data-card-id="${esc(cardId)}"${isOpen ? " open" : ""}><summary>Execution contract &amp; proof</summary><div class="ev-kv" style="margin-top:8px">${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div></details>`
+          : "";
+        body = `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}</div>${moreHtml}`;
+      } else {
+        body = `<div class="ev-body">${esc(ev.message)}</div>`;
+      }
       const copyBtn = ev.message ? `<div class="ev-foot"><button class="mini-btn" data-copy-ev="${idx}">Copy Prompt</button></div>` : "";
-      return `<div class="ev-card k-correction"><div class="ev-head"><strong>Guardian Prompt #${ev._promptNum}</strong>${delivPill}${outPill}<time>${esc(fullTime(ev.at))}</time></div>${body}${copyBtn}</div>`;
+      return `<div class="ev-card k-correction"><div class="ev-head"><strong>Guardian Prompt #${ev._promptNum}</strong>${delivPill}${outPill}${turnPill}<time>${esc(fullTime(ev.at))}</time></div>${body}${copyBtn}</div>`;
     }
     if (ev.kind === "error") {
       return `<div class="ev-card k-error"><div class="ev-head"><strong>Observer Error</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div>`;
@@ -691,19 +773,25 @@ function clientApp() {
     const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Completed", "st-completed"], pending: ["Needs Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
     const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
     const cached = sessionCache.get(s.key);
-    const rawEvents = (chatMode === "all" && cached?.events?.length) ? cached.events : s.events;
-    const timeline = buildTimeline(rawEvents, chatMode === "all");
-    const hasTurns = timeline.some((x) => x.kind === "turn_user" || x.kind === "turn_assistant");
+    const fullRaw = cached?.events?.length ? cached.events : s.events;
+    const promptsTimeline = buildTimeline(fullRaw, false);
+    const allTimeline = buildTimeline(fullRaw, true);
+    const timeline = chatMode === "all" ? allTimeline : promptsTimeline;
+    const hasTurns = allTimeline.some((x) => x.kind === "turn_user" || x.kind === "turn_assistant");
     const showAllBanner = chatMode === "all" && !hasTurns
-      ? `<div class="hint-banner">${cached?.loading ? "Loading full conversation messages…" : "Only Guardian & follow-up messages are stored for this older session (new & backfilled sessions include full User/Agent turns)."}</div>`
+      ? `<div class="hint-banner">${cached?.loading ? "Loading full conversation messages…" : "Only Guardian & follow-up messages are stored for this older session (recent & backfilled sessions include full User/Agent turns)."}</div>`
+      : "";
+    const promptTotal = promptsTimeline.filter((x) => x.kind === "correction").length;
+    const expandBtn = promptTotal > 1
+      ? `<button class="mini-btn" data-toggle-expand="1">${expandAllCards ? "Collapse All" : "Expand All"}</button>`
       : "";
 
     return `<div class="d-top">
         <div class="tt">${esc(title)}</div>
         <div class="navs">
           <div class="seg" role="group" aria-label="Message visibility">
-            <button class="seg-b${chatMode === "prompts" ? " on" : ""}" data-mode="prompts">Sent Prompts</button>
-            <button class="seg-b${chatMode === "all" ? " on" : ""}" data-mode="all">All Messages</button>
+            <button class="seg-b${chatMode === "prompts" ? " on" : ""}" data-mode="prompts">Sent Prompts · ${promptsTimeline.length}</button>
+            <button class="seg-b${chatMode === "all" ? " on" : ""}" data-mode="all">All Messages${cached?.events ? ` · ${allTimeline.length}` : ""}</button>
           </div>
           ${inSheet ? '<button class="glass close-btn" data-act="close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ""}
           <button class="glass" data-act="prev" ${selIdx <= 0 ? "disabled" : ""} aria-label="Previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
@@ -733,10 +821,11 @@ function clientApp() {
             <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy URL" : "Copy Resume Command"}</button>
           </div>
         </div>
-        <div class="ev-sec">${chatMode === "all" ? "Conversation Chronology (Oldest → Newest)" : "Guardian Prompts & Follow-Ups (Oldest → Newest)"} · ${timeline.length}</div>
+        <div class="ev-sec-row"><div class="ev-sec">${chatMode === "all" ? "Conversation Chronology (Oldest → Newest)" : "Guardian Prompts (Oldest → Newest)"} · ${timeline.length}</div>${expandBtn}</div>
         ${showAllBanner}
-        <div class="cards">${timeline.length ? timeline.map((e, i) => timelineItemHtml(e, i)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions required.</div></div>'}</div>
-      </div>`;
+        <div class="cards">${timeline.length ? timeline.map((e, i) => timelineItemHtml(e, i, s.key)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions required.</div></div>'}</div>
+      </div>
+      <button class="jump-bot" data-jump-bot="1" hidden>↓ Latest</button>`;
   }
 
   async function fetchSessionDetail(s, scrollBottom = false) {
@@ -771,14 +860,27 @@ function clientApp() {
           <span class="plat-sess">${st.sessions || 0}</span>
         </div>
         <div class="plat-stats">
-          <span>${st.corrections || 0} prompts</span>
+          <span>${st.prompts || st.corrections || 0} prompts</span>
           <span>${st.delivered || 0} deliv</span>
           <span>${st.verified || 0} ok</span>
+          ${st.redirected ? `<span>${st.redirected} redir</span>` : ""}
           <span>${st.manual_followups || 0} manual</span>
           ${st.errors ? `<span style="color:var(--red)">${st.errors} err</span>` : ""}
         </div>
       </button>`;
     }).join("");
+
+    const corrs = Number(m.corrections || 0);
+    const deliv = Number(m.delivered || 0);
+    const ver = Number(m.verified || 0);
+    const closed = ver + Number(m.superseded || 0) + Number(m.redirected || 0);
+    const delivRate = corrs ? `${Math.round((deliv / corrs) * 100)}%` : "—";
+    const verRate = closed ? `${Math.round((ver / closed) * 100)}%` : "—";
+    const m24 = m.last_24h || {};
+    const watchEvents = Array.isArray(w.recent_events) ? w.recent_events : [];
+    const watchFeedHtml = watchEvents.length
+      ? watchEvents.slice(0, 12).map((ev) => `<div class="ev-card"><div class="ev-head"><span class="badge-pill st-ongoing">${esc(ev.kind || "info")}</span><strong>${esc(ev.detail || "")}</strong><time>${esc(ev.at ? fullTime(Date.parse(ev.at) / 1000) : "")}</time></div></div>`).join("")
+      : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Waiting for next watcher action event…</div></div>';
 
     const cats = Object.entries(m.manual_by_category || {}).sort((a, b) => b[1] - a[1]);
     const catPills = cats.length
@@ -816,8 +918,17 @@ function clientApp() {
           </div>
         </div>
       </div>
+      <div class="ev-sec">Effectiveness Funnel</div>
+      <div class="funnel-grid">
+        <div class="kpi"><div class="kv">${esc(delivRate)}</div><div class="kl">Delivery Rate</div><div class="ks">${deliv}/${corrs} prompts</div></div>
+        <div class="kpi"><div class="kv">${esc(verRate)}</div><div class="kl">Verified Rate</div><div class="ks">${ver}/${closed} closed (${m.redirected ?? 0} redir)</div></div>
+        <div class="kpi"><div class="kv">${esc(fmtDuration(m.median_resolution_sec))}</div><div class="kl">Median Resolution</div><div class="ks">prompt → verified</div></div>
+        <div class="kpi"><div class="kv">${esc(m24.corrections ?? 0)}</div><div class="kl">Last 24h Prompts</div><div class="ks">${m24.verified ?? 0} ok · ${m24.manual_followups ?? 0} manual · ${m24.errors ?? 0} err</div></div>
+      </div>
       <div class="ev-sec">Platform Coverage Matrix</div>
       <div class="plat-grid">${platRows}</div>
+      <div class="ev-sec">Live Watcher Activity (${watchEvents.length})</div>
+      <div class="cards">${watchFeedHtml}</div>
       <div class="ev-sec">Where User Still Had to Manually Prompt (${m.manual_followups ?? 0})</div>
       <div class="hero-card"><div class="hero-tags">${catPills}</div></div>
       <div class="cards" style="margin-top:10px">${recentManual || '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Zero post-Guardian manual follow-ups captured yet.</div></div>'}</div>
@@ -849,9 +960,16 @@ function clientApp() {
     const prevScroll = !scrollToBottom && oldScroll ? oldScroll.scrollTop : null;
     root.innerHTML = detailHtml(s, !wide);
     const sc = root.querySelector(".d-scroll");
+    const jb = root.querySelector("[data-jump-bot]");
+    const syncJumpBtn = () => {
+      if (!sc || !jb) return;
+      jb.hidden = (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 220;
+    };
     if (sc) {
       if (scrollToBottom) sc.scrollTop = sc.scrollHeight;
       else if (prevScroll !== null) sc.scrollTop = prevScroll;
+      sc.addEventListener("scroll", syncJumpBtn, { passive: true });
+      syncJumpBtn();
     }
     document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
   }
@@ -861,7 +979,7 @@ function clientApp() {
     selIdx = i;
     selKey = filtered[i].key;
     renderDetail(true);
-    if (chatMode === "all") fetchSessionDetail(filtered[i], true);
+    fetchSessionDetail(filtered[i], chatMode === "all");
     if (!isWide()) { $("bd").classList.add("on"); $("sheet").classList.add("on"); document.body.style.overflow = "hidden"; }
   }
   function openKey(key) {
@@ -887,7 +1005,27 @@ function clientApp() {
   }
 
   function bindRoot(root) {
+    root.addEventListener("toggle", (e) => {
+      const det = e.target;
+      if (!(det instanceof HTMLDetailsElement) || !det.dataset.cardId) return;
+      const id = det.dataset.cardId;
+      if (det.open) { expandedCards.add(id); collapsedCards.delete(id); }
+      else { expandedCards.delete(id); collapsedCards.add(id); }
+    }, true);
     root.addEventListener("click", (e) => {
+      const expBtn = e.target.closest("[data-toggle-expand]");
+      if (expBtn) {
+        expandAllCards = !expandAllCards;
+        if (!expandAllCards) { expandedCards.clear(); collapsedCards.clear(); }
+        renderDetail(false);
+        return;
+      }
+      const jb = e.target.closest("[data-jump-bot]");
+      if (jb) {
+        const sc = root.querySelector(".d-scroll");
+        if (sc) sc.scrollTo({ top: sc.scrollHeight, behavior: "smooth" });
+        return;
+      }
       const modeBtn = e.target.closest("[data-mode]");
       if (modeBtn) {
         chatMode = modeBtn.dataset.mode;
@@ -928,7 +1066,7 @@ function clientApp() {
       if (evBtn) {
         const s = filtered[selIdx];
         const cached = s ? sessionCache.get(s.key) : null;
-        const rawEvents = (chatMode === "all" && cached?.events?.length) ? cached.events : (s?.events || []);
+        const rawEvents = (cached?.events?.length) ? cached.events : (s?.events || []);
         const timeline = buildTimeline(rawEvents, chatMode === "all");
         const msg = timeline[+evBtn.dataset.copyEv]?.message || "";
         if (msg) navigator.clipboard?.writeText(msg).then(() => toast("Copied Guardian prompt"), () => toast("Copy unavailable"));
@@ -971,12 +1109,24 @@ function clientApp() {
   });
   addEventListener("resize", () => { if (isWide()) closeSheet(); renderList(); });
 
+  applyTheme();
+  if ($("themeBtn")) {
+    $("themeBtn").onclick = () => {
+      themeMode = themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
+      try { localStorage.setItem("ig_theme", themeMode); } catch {}
+      applyTheme();
+    };
+  }
   async function syncLive(manual) {
     if (document.hidden && !manual) return;
     if (manual) $("refreshBtn").classList.add("spin");
     try {
       const res = await fetch("/api/state", { cache: "no-store" });
-      if (res.ok) { state = await res.json(); renderList(); }
+      if (res.ok) {
+        state = await res.json();
+        const hasSel = !manual && Boolean(window.getSelection()?.toString()?.trim());
+        renderList(hasSel);
+      }
     } catch {}
     if (manual) setTimeout(() => $("refreshBtn").classList.remove("spin"), 350);
   }
@@ -1010,7 +1160,7 @@ function dashboardHtml() {
   --ease:cubic-bezier(.32,.72,0,1);--st:env(safe-area-inset-top,0px);--sb:env(safe-area-inset-bottom,0px);
 }
 @media (prefers-color-scheme:dark){
-  :root{
+  :root:not([data-theme="light"]){
     --accent:#0A84FF;--accent-soft:rgba(10,132,255,.2);
     --green:#30D158;--green-soft:rgba(48,209,88,.18);
     --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.18);
@@ -1020,6 +1170,17 @@ function dashboardHtml() {
     --sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);--bar:rgba(22,22,24,.86);
   }
 }
+html[data-theme="dark"]{
+  color-scheme:dark;
+  --accent:#0A84FF;--accent-soft:rgba(10,132,255,.2);
+  --green:#30D158;--green-soft:rgba(48,209,88,.18);
+  --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.18);
+  --red:#FF453A;--red-soft:rgba(255,69,58,.18);
+  --pink:#FF375F;--pink-soft:rgba(255,55,95,.2);
+  --bg:#000000;--card:#1C1C1E;--label:#FFFFFF;--label-2:rgba(235,235,245,.62);--label-3:rgba(235,235,245,.34);
+  --sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);--bar:rgba(22,22,24,.86);
+}
+html[data-theme="light"]{color-scheme:light}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;color-scheme:light dark}
 body{font-family:var(--text);background:var(--bg);color:var(--label);-webkit-font-smoothing:antialiased;overscroll-behavior:none;font-size:15px}
@@ -1129,6 +1290,17 @@ svg{display:block}
 .act.primary{background:var(--accent);color:#fff}
 .act svg{width:15px;height:15px;flex:none}
 .ev-sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:16px 4px 8px}
+.ev-sec-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 4px 8px}
+.ev-sec-row .ev-sec{margin:0}
+.ev-more{margin-top:4px;border-top:.5px solid var(--sep);padding-top:6px}
+.ev-more summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--accent);list-style:none;user-select:none;display:inline-flex;align-items:center;gap:5px}
+.ev-more summary::-webkit-details-marker{display:none}
+.ev-more summary::before{content:"▸";font-size:11px;transition:transform .15s}
+.ev-more[open] summary::before{transform:rotate(90deg)}
+.funnel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.jump-bot{position:absolute;right:18px;bottom:calc(18px + var(--sb));z-index:25;background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;padding:7px 13px;border-radius:18px;box-shadow:0 4px 16px rgba(0,0,0,.22);transition:transform .15s}
+.jump-bot:active{transform:scale(.95)}
+.jump-bot[hidden]{display:none}
 .hint-banner{background:var(--fill);color:var(--label-2);font-size:12.5px;padding:9px 12px;border-radius:10px;margin-bottom:10px}
 .cards{display:flex;flex-direction:column;gap:10px}
 .chat-row{display:flex;width:100%}
@@ -1179,6 +1351,7 @@ svg{display:block}
     <div class="navbar" id="navbar">
       <div class="t">Intent Guardian</div>
       <div class="r">
+        <button class="pill-btn" id="themeBtn" aria-label="Toggle theme">Auto</button>
         <button class="pill-btn" id="overviewBtn" aria-label="Overview">Overview</button>
         <button class="ib" id="refreshBtn" aria-label="Refresh">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
@@ -1231,6 +1404,21 @@ function serve(database, feedToken, readerPassword) {
     }
     if (route === "/events" && request.method === "POST") return ingest(request, database, feedAuthorization);
     if (route === "/watcher" && request.method === "POST") return ingestWatcher(request, database, feedAuthorization);
+    if (route === "/admin/prune-ghosts" && request.method === "POST") {
+      if (!matches(request.headers.authorization, feedAuthorization)) {
+        return response("Unauthorized", 401);
+      }
+      const cutoff = Date.now() / 1000 - 86400;
+      const info = database.prepare(`
+        DELETE FROM events
+        WHERE kind = 'seen' AND at < ?
+          AND NOT EXISTS (
+            SELECT 1 FROM events e2
+            WHERE e2.host = events.host AND e2.session_id = events.session_id AND e2.kind <> 'seen'
+          )
+      `).run(cutoff);
+      return response(JSON.stringify({ pruned: Number(info.changes || 0) }), 200, { "Content-Type": "application/json" });
+    }
     if (route === "/api/state" && request.method === "GET") {
       if (!matches(request.headers.authorization, readerAuthorization)) {
         return response("Unauthorized", 401, { "WWW-Authenticate": 'Basic realm="Intent Guardian", charset="UTF-8"' });

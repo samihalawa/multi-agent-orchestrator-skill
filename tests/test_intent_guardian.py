@@ -1141,6 +1141,114 @@ class GuardianContracts(unittest.TestCase):
         self.assertIn("injectSteps", out)
         self.assertEqual(st["intent"], [])
 
+    def test_v21_iso_timestamps_and_eviction_proof_chat_turns(self):
+        transcript = self.root / "codex_evict.jsonl"
+        rows = [
+            {"type": "session_meta", "timestamp": "2026-11-25T10:00:00Z", "payload": {"id": "v21-iso"}},
+            {"type": "response_item", "timestamp": "2026-11-25T10:00:05Z",
+             "payload": {"type": "message", "id": "u1", "role": "user", "content": [{"type": "input_text", "text": "Fix all services"}]}},
+            {"type": "response_item", "timestamp": "2026-11-25T10:00:20Z",
+             "payload": {"type": "message", "id": "a1", "role": "assistant", "content": [{"type": "output_text", "text": "Starting sweep."}]}},
+        ]
+        # Overwhelm rolling state["evidence"] (240 items) with tool results
+        for i in range(260):
+            rows.append({
+                "type": "response_item", "timestamp": f"2026-11-25T10:01:{i % 60:02d}Z",
+                "payload": {"type": "function_call_output", "call_id": f"c{i}", "output": f"tool_dump_{i}"},
+            })
+        rows.append({
+            "type": "response_item", "timestamp": "2026-11-25T10:06:00Z",
+            "payload": {"type": "message", "id": "a2", "role": "assistant", "content": [{"type": "output_text", "text": "Done sweep."}]},
+        })
+        transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        state_dir = self.root / "state"
+        _, st = g.process_event({"session_id": "v21-iso", "hook_event_name": "Stop", "transcript_path": str(transcript)}, "codex", self.cfg, state_dir, self.reviewer)
+        # state["evidence"] dicts remain strictly {id, kind, text}
+        self.assertTrue(all(set(e.keys()) == {"id", "kind", "text"} for e in st["evidence"]))
+        # u1 & a1 were evicted from rolling evidence by 260 tool rows, yet preserved in chat_turns with exact timestamps
+        self.assertFalse(any(e["id"] == "e:u1" for e in st["evidence"]))
+        evts = g.feed_events(st, include_messages=True)
+        turns = [e for e in evts if e["kind"] in ("turn_user", "turn_assistant")]
+        self.assertEqual([t["message"] for t in turns], ["Fix all services", "Starting sweep.", "Done sweep."])
+        self.assertAlmostEqual(turns[0]["at"], g._parse_iso_ts("2026-11-25T10:00:05Z"), places=2)
+        self.assertAlmostEqual(turns[1]["at"], g._parse_iso_ts("2026-11-25T10:00:20Z"), places=2)
+        self.assertAlmostEqual(turns[2]["at"], g._parse_iso_ts("2026-11-25T10:06:00Z"), places=2)
+
+    def test_v21_session_title_scheduled_automation_and_native_priority(self):
+        self.assertEqual(
+            g._session_title({"intent": [{"text": '<scheduled-task name="tender-file-best-100">\nThis is an automated run.'}], "project": "p"}),
+            "Scheduled: tender-file-best-100",
+        )
+        self.assertEqual(
+            g._session_title({"intent": [{"text": "Automation: Daily Sync\nAutomation ID: abc"}], "project": "p"}),
+            "Auto: Daily Sync",
+        )
+        self.assertEqual(
+            g._session_title({"native_title": "Clean Human Title", "intent": [{"text": "noisy typo prompt"}], "project": "p"}),
+            "Clean Human Title",
+        )
+
+    def test_v21_partial_progress_supersedes_pending_stop_with_new_tool_evidence(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Deploy and verify both alpha and beta"))
+        def first(cfg, payload):
+            return {"intervene": True, "verdict_domain": "closure", "reason": "Alpha not deployed yet.",
+                    "next_action": "Deploy alpha service and check health endpoint.", "proof_needed": "Alpha 200 OK.",
+                    "evidence_ids": [payload["intent"][0]["id"]]}, {"usage": {}}
+        out1, st1 = self.run_event(self.event("Stop"), first)
+        self.assertIn("decision", out1)
+        self.run_event(self.event("PostToolUse", tool_name="Bash", tool_response="Alpha deployed HTTP 200"))
+        def second(cfg, payload):
+            # Judge cites only the assistant closeout, NOT the tool ID directly; partial progress must still supersede
+            asst_id = next(e["id"] for e in reversed(payload["evidence"]) if e["kind"] == "assistant")
+            return {"intervene": True, "verdict_domain": "closure", "reason": "Beta still missing live migration.",
+                    "next_action": "Run beta database migration script and inspect schema rows.", "proof_needed": "Schema migrated.",
+                    "evidence_ids": [asst_id]}, {"usage": {}}
+        out2, st2 = self.run_event(self.event("Stop", last_assistant_message="Alpha is done, stopping now."), second)
+        self.assertIn("decision", out2)
+        self.assertEqual(st2["interventions"], 2)
+
+    def test_v21_auto_resolves_completed_and_redirects_on_new_human_revision(self):
+        self.run_event(self.event("UserPromptSubmit", prompt="Task A"))
+        out1, _ = self.run_event(self.event("Stop"), lambda cfg, p: (
+            {"intervene": True, "verdict_domain": "closure", "reason": "Task A incomplete.",
+             "next_action": "Run Task A command.", "proof_needed": "Output.", "evidence_ids": [p["intent"][0]["id"]]}, {"usage": {}}
+        ))
+        self.assertIn("decision", out1)
+        # New human revision redirects topic, then Stop passes cleanly without intervening -> pending becomes redirected
+        self.run_event(self.event("UserPromptSubmit", prompt="Actually switch to Task B instead"))
+        self.run_event(self.event("PostToolUse", tool_name="Bash", tool_response="Task B OK"))
+        _, st = self.run_event(self.event("Stop", last_assistant_message="Task B done."), lambda cfg, p: (
+            {"intervene": False, "resolved": False, "completed": True, "verdict_domain": "closure",
+             "evidence_ids": [next(e["id"] for e in reversed(p["evidence"]) if e["kind"] == "tool")],
+             "state_delta": "Switched to Task B and verified."}, {"usage": {}}
+        ))
+        self.assertIsNone(st.get("pending"))
+        outcomes = [c["outcome"]["status"] for c in st["corrections"].values()]
+        self.assertTrue(any(o in ("verified", "redirected") for o in outcomes))
+
+    def test_v21_sync_feed_all_recent_preserves_cursor_and_hydrates_turns(self):
+        transcript = self.root / "claude_hist.jsonl"
+        transcript.write_text("\n".join([
+            json.dumps({"type": "custom-title", "customTitle": "TENDERLOOP Daily Audit"}),
+            json.dumps({"type": "user", "uuid": "u1", "timestamp": "2026-11-25T11:00:00Z", "message": {"content": "Check open tenders"}}),
+            json.dumps({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-25T11:01:00Z", "message": {"content": [{"type": "text", "text": "Checked 12 tenders."}]}}),
+        ]) + "\n")
+        state_dir = self.root / "state"
+        _, st = g.process_event({"session_id": "cl-hist-1", "hook_event_name": "Stop", "transcript_path": str(transcript)}, "claude", self.cfg, state_dir, self.reviewer)
+        st_path = state_dir / (g.digest(["claude", "cl-hist-1"])[:32] + ".json")
+        raw_st = json.loads(st_path.read_text())
+        saved_offset, saved_line = raw_st["offset"], raw_st["line"]
+        raw_st.pop("chat_turns", None)
+        raw_st.pop("native_title", None)
+        st_path.write_text(json.dumps(raw_st))
+        reloaded = json.loads(st_path.read_text())
+        g.refresh_chat_turns_and_title(reloaded)
+        self.assertEqual(reloaded["offset"], saved_offset)
+        self.assertEqual(reloaded["line"], saved_line)
+        self.assertEqual(reloaded.get("native_title"), "TENDERLOOP Daily Audit")
+        self.assertEqual(len(reloaded.get("chat_turns", [])), 2)
+        self.assertAlmostEqual(reloaded["chat_turns"][0]["at"], g._parse_iso_ts("2026-11-25T11:00:00Z"), places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

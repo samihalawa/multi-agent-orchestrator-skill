@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]"
 WEB_HOSTS = {"chatgpt", "claude_ai", "gemini_web", "grokbot"}
 MEMORY_CHECK_RE = re.compile(
@@ -418,7 +420,60 @@ def classify_manual_followup(text):
     return "steering"
 
 
-def add_evidence(state, kind, text, source_id):
+def _parse_iso_ts(raw):
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if val > 1e12:
+            val /= 1000.0
+        return val if val > 1e9 else None
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        num = float(s)
+        if num > 1e12:
+            num /= 1000.0
+        return num if num > 1e9 else None
+    except ValueError:
+        pass
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _row_timestamp(row, host):
+    if not isinstance(row, dict):
+        return None
+    if host == "antigravity":
+        return _parse_iso_ts(row.get("created_at") or row.get("timestamp") or row.get("createdAt"))
+    return _parse_iso_ts(row.get("timestamp") or row.get("created_at") or row.get("createdAt"))
+
+
+def _record_chat_turn(state, source_id, role, text, ts):
+    turns = state.setdefault("chat_turns", [])
+    clean_text = bounded(redact(text), 1200)
+    for item in turns:
+        if item.get("id") == source_id:
+            item["role"] = role
+            item["at"] = float(ts)
+            item["text"] = clean_text
+            return
+    turns.append({"id": source_id, "role": role, "at": float(ts), "text": clean_text})
+    if len(turns) > 40:
+        state["chat_turns"] = turns[-40:]
+
+
+def add_evidence(state, kind, text, source_id, event_at=None):
     text = redact(text).strip()
     if not text:
         return
@@ -443,12 +498,14 @@ def add_evidence(state, kind, text, source_id):
     limit = 6000 if kind == "action" and text.startswith(("Agent ", "Task ", "spawn_agent ")) else 2000
     entry = {"id": source_id, "kind": kind, "text": text if kind in {"user", "task_request"} else bounded(text, limit)}
     state["evidence"].append(entry)
+    event_ts = float(event_at) if isinstance(event_at, (int, float)) and event_at > 0 else time.time()
     if kind in {"user", "assistant"}:
         turn_times = state.setdefault("turn_times", {})
-        turn_times[source_id] = time.time()
+        turn_times[source_id] = event_ts
         if len(turn_times) > STORE_RECORDS * 2:
-            keep = {e["id"] for e in state["evidence"]}
+            keep = {e["id"] for e in state["evidence"]} | {t.get("id") for t in state.get("chat_turns", [])}
             state["turn_times"] = {k: v for k, v in turn_times.items() if k in keep}
+        _record_chat_turn(state, source_id, kind, text, event_ts)
     state["evidence"] = state["evidence"][-STORE_RECORDS:]
     while len(state["evidence"]) > 2 and sum(len(e["text"]) for e in state["evidence"]) > STORE_CHARS:
         state["evidence"].pop(0)
@@ -467,7 +524,7 @@ def add_evidence(state, kind, text, source_id):
                 if not any(f.get("id") == source_id for f in followups):
                     followups.append({
                         "id": source_id,
-                        "at": time.time(),
+                        "at": event_ts,
                         "category": classify_manual_followup(text),
                         "snippet": bounded(redact(text), 220),
                         "had_pending": bool(state.get("pending")),
@@ -494,6 +551,8 @@ def ingest(state, event, host):
     revision_before_read = state.get("human_revision", 0)
     job = event.get("_controller_job")
     if job:
+        if isinstance(job.get("title"), str) and job["title"].strip():
+            state["native_title"] = redact(job["title"].strip())[:100]
         prompt = job["prompt"]
         prompt_hash = digest(prompt)
         if prompt_hash != state.get("controller_prompt_hash"):
@@ -501,6 +560,36 @@ def ingest(state, event, host):
             add_evidence(state, "user", prompt, "job-prompt:" + prompt_hash[:16])
         for result in job["evidence"]:
             add_evidence(state, "tool", result, "job-proof:" + digest(result)[:16])
+        job_turns = job.get("turns")
+        if isinstance(job_turns, list) and job_turns:
+            now_ts = time.time()
+            prev_ts = {
+                (t.get("role"), t.get("text")): t.get("at")
+                for t in state.get("chat_turns", [])
+                if isinstance(t, dict) and isinstance(t.get("at"), (int, float))
+            }
+            rebuilt_turns = []
+            slice_turns = job_turns[-40:]
+            for idx, jt in enumerate(slice_turns):
+                if not isinstance(jt, dict):
+                    continue
+                role = jt.get("role")
+                txt = redact(jt.get("text", "")).strip()
+                if role not in {"user", "assistant"} or not txt:
+                    continue
+                if role == "user" and (txt.startswith(GUARDIAN_TAG + " ") or digest(txt) in state.get("emitted_feedback_hashes", [])):
+                    continue
+                ct = bounded(txt, 1200)
+                parsed_at = _parse_iso_ts(jt.get("at"))
+                if parsed_at is None:
+                    parsed_at = prev_ts.get((role, ct))
+                if not isinstance(parsed_at, (int, float)) or parsed_at <= 0:
+                    parsed_at = now_ts - (len(slice_turns) - idx) * 2.0
+                tid = "e:job-turn:" + str(idx) + ":" + digest([role, ct])[:12]
+                rebuilt_turns.append({"id": tid, "role": role, "at": float(parsed_at), "text": ct})
+                state.setdefault("turn_times", {})[tid] = float(parsed_at)
+            if rebuilt_turns:
+                state["chat_turns"] = rebuilt_turns[-40:]
         receipt = job.get("delivery")
         if isinstance(receipt, dict) and isinstance(receipt.get("source_id"), str):
             correction = state.get("corrections", {}).get(receipt.get("correction_hash"))
@@ -555,6 +644,11 @@ def ingest(state, event, host):
                             sys_text = flatten(row.get("content", ""))
                             if GUARDIAN_TAG not in sys_text and re.search(r"\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}(?=[\s\]]|$)", sys_text):
                                 state["subagent"] = True
+                    elif host in {"claude", "cowork"} and row.get("type") == "custom-title" and row.get("customTitle"):
+                        ct = str(row["customTitle"]).strip()[:100]
+                        if ct:
+                            state["native_title"] = ct
+                    row_ts = _row_timestamp(row, host)
                     for kind, text, sid in records(row, host, state["line"]):
                         if kind == "runtime_feedback":
                             cleaned_fb = text.strip()
@@ -584,7 +678,7 @@ def ingest(state, event, host):
                         if signature == prior.get("signature") and transport != prior.get("transport") and kind in {"user", "assistant"}:
                             state["last_transport_record"] = {"signature": signature, "transport": transport}
                             continue
-                        add_evidence(state, kind, text, sid)
+                        add_evidence(state, kind, text, sid, event_at=row_ts)
                         if state["line"] in state.get("audit_focus_lines", []):
                             state.setdefault("audit_focus_evidence", []).append(
                                 {"id": "e:line:" + str(state["line"]) + ":" + kind,
@@ -594,6 +688,10 @@ def ingest(state, event, host):
                         state["last_transport_record"] = {"signature": signature, "transport": transport}
                 state["offset"] = stream.tell()
             state.pop("source_error", None)
+            if not state.get("native_title") and host in {"antigravity", "codex"}:
+                nt = _resolve_native_title(host, state.get("session_id"))
+                if nt:
+                    state["native_title"] = nt
     if event.get("hook_event_name") == "UserPromptSubmit" and real_prompt(str(event.get("prompt", ""))):
         prompt = redact(event["prompt"]).strip()
         # The hook often precedes the matching transcript append. Treat those as
@@ -1287,6 +1385,11 @@ def normalize_decision(decision, payload):
         comp_ids = set(d["evidence_ids"]) | (set(d["resolution_evidence_ids"]) if d.get("resolved") else set())
         if comp_ids and not any(e["id"] in comp_ids and e["kind"] == "tool" for e in payload["evidence"]):
             d["completed"] = False
+        if d.get("completed") and pending and not d.get("resolved"):
+            promoted = _has_new_tool_proof(d["evidence_ids"], payload, pending)
+            if promoted:
+                d["resolved"] = True
+                d["resolution_evidence_ids"] = list(dict.fromkeys(d["resolution_evidence_ids"] + promoted))
     return d
 
 
@@ -1299,9 +1402,9 @@ def supersedes_pending_stop(decision, payload, pending, *, question_stop=False):
         return False
     if _action_similarity(decision["next_action"], pending.get("next_action", "")) >= 0.72:
         return False
-    new_citations = set(decision["evidence_ids"]) - set(pending.get("review_evidence_ids", []))
+    prev_ids = set(pending.get("review_evidence_ids", []))
     earlier_tool_results = set(pending.get("review_tool_digests", []))
-    return any(e["id"] in new_citations and e["kind"] == "tool" and digest(e["text"]) not in earlier_tool_results
+    return any(e["id"] not in prev_ids and e["kind"] == "tool" and digest(e.get("text", "")) not in earlier_tool_results
                for e in payload["evidence"])
 
 
@@ -1743,6 +1846,11 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                         pending_record["outcome"] = {"status": "verified", "at": time.time(),
                                                      "evidence_ids": decision.get("resolution_evidence_ids", [])}
                     state["pending"] = None
+                elif not decision.get("intervene") and state.get("pending") and state["pending"].get("human_revision", 0) < state.get("human_revision", 0):
+                    pending_record = state.get("corrections", {}).get(state["pending"].get("feedback_hash"))
+                    if pending_record is not None:
+                        pending_record["outcome"] = {"status": "redirected", "at": time.time(), "reason": "human_redirected"}
+                    state["pending"] = None
                 if decision.get("intervene"):
                     correction_hash = digest({k: decision.get(k) for k in ["reason", "next_action", "proof_needed", "evidence_ids"]})
                     pending = state.get("pending")
@@ -1838,7 +1946,60 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         return output, state
 
 
+def _clean_title_text(raw):
+    line = " ".join(str(raw or "").splitlines()).strip()
+    line = re.sub(r"[^\w .@+\-_:/()–—?!,'\"]", "", line)
+    return redact(line)[:95].strip()
+
+
+def _resolve_native_title(host, session_id):
+    if not session_id:
+        return None
+    sid = str(session_id).strip()
+    home = Path.home()
+    try:
+        if host == "antigravity":
+            db_path = home / ".gemini/antigravity/conversation_summaries.db"
+            if db_path.is_file():
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.3)
+                try:
+                    row = con.execute("SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1", (sid,)).fetchone()
+                    if row and isinstance(row[0], str) and row[0].strip():
+                        return _clean_title_text(row[0])
+                finally:
+                    con.close()
+        elif host == "codex":
+            codex_db = home / ".codex/sqlite/codex.db"
+            if codex_db.is_file():
+                con = sqlite3.connect(f"file:{codex_db}?mode=ro", uri=True, timeout=0.3)
+                try:
+                    for q in (
+                        "SELECT thread_title FROM automation_runs WHERE thread_id = ? LIMIT 1",
+                        "SELECT display_title FROM local_thread_catalog WHERE thread_id = ? LIMIT 1",
+                    ):
+                        row = con.execute(q, (sid,)).fetchone()
+                        if row and isinstance(row[0], str) and row[0].strip():
+                            return _clean_title_text(row[0])
+                finally:
+                    con.close()
+            state5 = home / ".codex/state_5.sqlite"
+            if state5.is_file():
+                con = sqlite3.connect(f"file:{state5}?mode=ro", uri=True, timeout=0.3)
+                try:
+                    row = con.execute("SELECT title FROM threads WHERE id = ? LIMIT 1", (sid,)).fetchone()
+                    if row and isinstance(row[0], str) and row[0].strip():
+                        return _clean_title_text(row[0])
+                finally:
+                    con.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return None
+
+
 def _session_title(state):
+    native = _clean_title_text(state.get("native_title"))
+    if native:
+        return native
     raw = ""
     for e in state.get("intent") or []:
         t = str(e.get("text") or "").strip()
@@ -1847,10 +2008,82 @@ def _session_title(state):
             break
     if not raw:
         return state.get("project")
+    sched = re.search(r'<scheduled-task[^>]*\bname="([^"]+)"', raw)
+    if sched and sched.group(1).strip():
+        return _clean_title_text("Scheduled: " + sched.group(1).strip())
+    auto_m = re.match(r"^Automation:\s*([^\n]+)", raw)
+    if auto_m and auto_m.group(1).strip():
+        return _clean_title_text("Auto: " + auto_m.group(1).strip())
     clean = re.sub(r"^(?:\[[^\]]+\]\s*|<[^>]+>\s*)+", "", raw).strip()
-    line = " ".join((clean or raw).splitlines()).strip()
-    line = re.sub(r"[^\w .@+\-_:/()–—?!,'\"]", "", line)
-    return redact(line)[:90].strip() or state.get("project")
+    return _clean_title_text(clean or raw) or state.get("project")
+
+
+def refresh_chat_turns_and_title(state):
+    """Read-only backfill of real-timestamp chat_turns and native title without moving live cursors."""
+    host = state.get("host", "codex")
+    sid = state.get("session_id", "")
+    native = _resolve_native_title(host, sid)
+    if native:
+        state["native_title"] = native
+    path_text = state.get("transcript_path")
+    if not path_text:
+        return False
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        return bool(native)
+    turns = []
+    last_sig = None
+    last_transport = None
+    feedback_hashes = set(state.get("emitted_feedback_hashes", []))
+    try:
+        with path.open("rb") as stream:
+            for line_no, raw in enumerate(stream, 1):
+                if not raw.endswith(b"\n"):
+                    break
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if host in {"claude", "cowork"} and row.get("type") == "custom-title" and row.get("customTitle"):
+                    ct = _clean_title_text(row["customTitle"])
+                    if ct:
+                        state["native_title"] = ct
+                row_ts = _row_timestamp(row, host)
+                transport = str(row.get("type", "")) + ":" + str((row.get("payload") or {}).get("type", "") if isinstance(row.get("payload"), dict) else "")
+                for kind, text, rec_sid in records(row, host, line_no):
+                    if kind not in {"user", "assistant"}:
+                        continue
+                    cleaned = redact(text).strip()
+                    if not cleaned:
+                        continue
+                    if kind == "user":
+                        if digest(cleaned) in feedback_hashes:
+                            continue
+                        k2, cleaned = classify_prompt(cleaned)
+                        if k2 != "user":
+                            continue
+                    sig = digest([kind, cleaned])
+                    if sig == last_sig and transport != last_transport:
+                        last_transport = transport
+                        continue
+                    last_sig, last_transport = sig, transport
+                    turns.append({
+                        "id": "e:" + str(rec_sid),
+                        "role": kind,
+                        "at": row_ts,
+                        "text": bounded(cleaned, 1200),
+                    })
+    except OSError:
+        return bool(native)
+    if turns:
+        fallback_end = float(state.get("last_seen") or time.time())
+        recent_turns = turns[-40:]
+        for idx, t in enumerate(recent_turns):
+            if not isinstance(t["at"], (int, float)):
+                t["at"] = max(0.0, fallback_end - (len(recent_turns) - idx) * 2.0)
+            state.setdefault("turn_times", {})[t["id"]] = float(t["at"])
+        state["chat_turns"] = recent_turns
+    return True
 
 
 def feed_events(state, include_messages=False):
@@ -1862,6 +2095,10 @@ def feed_events(state, include_messages=False):
     if state.get("project"):
         shared["project"] = re.sub(r"[^\w .@+\-:/()–—]", "", str(state["project"]))[:80]
     if include_messages:
+        if not state.get("native_title") and host in {"antigravity", "codex"}:
+            nt = _resolve_native_title(host, session)
+            if nt:
+                state["native_title"] = nt
         title = _session_title(state)
         if title:
             shared["title"] = title
@@ -1879,18 +2116,31 @@ def feed_events(state, include_messages=False):
         category = error.get("category", "review_error")
         events.append(item("error", [category, error.get("at") or error.get("failed_at")], seen, message=category))
     if include_messages:
-        turns = [e for e in state.get("evidence", []) if e.get("kind") in {"user", "assistant"} and e.get("text")][-18:]
-        turn_times = state.get("turn_times", {})
-        for idx, entry in enumerate(turns):
-            tkind = "turn_user" if entry["kind"] == "user" else "turn_assistant"
-            tat = turn_times.get(entry.get("id"))
-            if not isinstance(tat, (int, float)):
-                tat = max(0.0, float(seen) - (len(turns) - idx) * 2.0)
-            events.append(item(tkind, entry.get("id", idx), tat, message=bounded(redact(entry["text"]), 1200)))
-    for entry in state.get("manual_followups", [])[-4:]:
+        chat_turns = state.get("chat_turns")
+        if isinstance(chat_turns, list) and chat_turns:
+            for idx, turn in enumerate(chat_turns[-30:]):
+                role = turn.get("role")
+                txt = turn.get("text")
+                if role not in {"user", "assistant"} or not txt:
+                    continue
+                tkind = "turn_user" if role == "user" else "turn_assistant"
+                tat = turn.get("at")
+                if not isinstance(tat, (int, float)):
+                    tat = max(0.0, float(seen) - (30 - idx) * 2.0)
+                events.append(item(tkind, turn.get("id", idx), tat, message=bounded(redact(txt), 1200)))
+        else:
+            turns = [e for e in state.get("evidence", []) if e.get("kind") in {"user", "assistant"} and e.get("text")][-30:]
+            turn_times = state.get("turn_times", {})
+            for idx, entry in enumerate(turns):
+                tkind = "turn_user" if entry["kind"] == "user" else "turn_assistant"
+                tat = turn_times.get(entry.get("id"))
+                if not isinstance(tat, (int, float)):
+                    tat = max(0.0, float(seen) - (len(turns) - idx) * 2.0)
+                events.append(item(tkind, entry.get("id", idx), tat, message=bounded(redact(entry["text"]), 1200)))
+    for entry in state.get("manual_followups", [])[-8:]:
         msg = f"[{entry.get('category', 'steering')}] {entry.get('snippet', '')}".strip()
         events.append(item("manual_followup", entry.get("id", entry.get("at")), entry.get("at", seen), message=bounded(redact(msg), 300)))
-    for key, correction in list(state.get("corrections", {}).items())[-6:]:
+    for key, correction in list(state.get("corrections", {}).items())[-10:]:
         message = correction.get("message")
         detail = {"message": bounded(redact(message), 2400)} if message else {}
         outcome = correction["outcome"]
@@ -2089,7 +2339,12 @@ function evalInTab(wsUrl, expression) {
         "last_assistant_message": last_asst,
         "_session_url": data.get("url"),
         "_project_name": (data.get("title") or host)[:80],
-        "_controller_job": {"prompt": "\n\n".join(prompts[-6:]) or data.get("title") or "Continue web task", "evidence": evidence[-10:]},
+        "_controller_job": {
+            "title": (data.get("title") or "").strip()[:120],
+            "prompt": "\n\n".join(prompts[-6:]) or data.get("title") or "Continue web task",
+            "evidence": evidence[-10:],
+            "turns": data.get("turns", [])[-30:],
+        },
     }
 
 
@@ -2106,6 +2361,8 @@ def main(argv=None):
     parser.add_argument("--through-line", type=int, help="Audit a transcript prefix through this physical JSONL line")
     parser.add_argument("--focus-line", type=int, action="append", default=[],
                         help="Citable evidence line for an isolated historical audit; repeat as needed")
+    parser.add_argument("--all-recent", type=int, default=0,
+                        help="Backfill & publish the N most recent sessions in sync-feed without altering live cursors")
     parser.add_argument("--event", default="Stop", choices=sorted(OBSERVE_EVENTS | REVIEW_EVENTS))
     args = parser.parse_args(argv)
     if args.command == "health":
@@ -2141,11 +2398,50 @@ def main(argv=None):
     try:
         cfg = load_config(args.config)
         if args.command == "sync-feed":
+            if args.all_recent and args.all_recent > 0:
+                files = sorted(
+                    (p for p in args.state_dir.glob("*.json") if p.name != "watcher-state.json"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[:args.all_recent]
+                refreshed, published, failed = 0, 0, 0
+                for file in files:
+                    try:
+                        st_raw = json.loads(file.read_text())
+                    except (OSError, ValueError):
+                        failed += 1
+                        continue
+                    h, sid = st_raw.get("host"), st_raw.get("session_id")
+                    if not h or not sid or st_raw.get("subagent"):
+                        continue
+                    lkey = digest([h, sid])[:32]
+                    with state_lock(args.state_dir / (lkey + ".lock")):
+                        try:
+                            state = json.loads(file.read_text())
+                        except (OSError, ValueError):
+                            failed += 1
+                            continue
+                        if refresh_chat_turns_and_title(state):
+                            atomic_save(file, state)
+                            refreshed += 1
+                        if publish_feed(cfg, state):
+                            published += 1
+                        else:
+                            failed += 1
+                print(json.dumps({"refreshed": refreshed, "published": published, "failed": failed}))
+                return 0
             if not args.session_id:
-                parser.error("sync-feed requires --session-id")
+                parser.error("sync-feed requires --session-id or --all-recent")
             key = digest([args.host, args.session_id])[:32]
             file = args.state_dir / (key + ".json")
-            print(json.dumps({"published": file.is_file() and publish_feed(cfg, json.loads(file.read_text()))}))
+            published = False
+            if file.is_file():
+                with state_lock(args.state_dir / (key + ".lock")):
+                    state = json.loads(file.read_text())
+                    if refresh_chat_turns_and_title(state):
+                        atomic_save(file, state)
+                    published = publish_feed(cfg, state)
+            print(json.dumps({"published": published}))
             return 0
         if args.command == "record-delivery":
             if not args.session_id:
@@ -2197,8 +2493,15 @@ def main(argv=None):
                 raise ValueError("Job review evidence must be a short list of primary tool results")
             session_url = event.get("session_url")
             project = event.get("project")
+            job_payload = {"prompt": prompt, "evidence": proofs, "delivery": event.get("delivery")}
+            if isinstance(event.get("title"), str) and event["title"].strip():
+                job_payload["title"] = event["title"].strip()[:120]
+            if isinstance(event.get("turns"), list):
+                clean_turns = [t for t in event["turns"][:40] if isinstance(t, dict) and t.get("role") in {"user", "assistant"} and isinstance(t.get("text"), str)]
+                if clean_turns:
+                    job_payload["turns"] = clean_turns
             event = {"session_id": sid, "hook_event_name": "Stop", "last_assistant_message": result,
-                     "_controller_job": {"prompt": prompt, "evidence": proofs, "delivery": event.get("delivery")}}
+                     "_controller_job": job_payload}
             if isinstance(session_url, str) and session_url.strip():
                 event["_session_url"] = session_url.strip()[:500]
             if isinstance(project, str) and project.strip():

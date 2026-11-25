@@ -41,7 +41,7 @@ const ONCE = ARGS.has('--once');
 const NO_DELIVER = ARGS.has('--no-deliver');
 const SEED_ONLY = ARGS.has('--seed-only');
 
-const WATCHER_VERSION = '2.0.0';
+const WATCHER_VERSION = '2.1.0';
 const GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]";
 const DEFAULT_INTERVAL_MS = 15_000;
 const STABLE_MS = 10_000;
@@ -52,10 +52,21 @@ const RECENT_WEB_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const RECENT_CODEX_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const COLD_SEED_AGE_MS = 5 * 60_000;
 const CLAUDE_PROJECTS_DIR = join(HOME, '.claude', 'projects');
+const AGY_BRAIN_DIR = join(HOME, '.gemini', 'antigravity', 'brain');
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha = (v) => createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v)).digest('hex');
+
+function recordWatcherEvent(state, kind, detail) {
+  const list = state.health.recent_events || [];
+  list.unshift({
+    at: new Date().toISOString(),
+    kind: String(kind || 'info').slice(0, 32),
+    detail: String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 140),
+  });
+  state.health.recent_events = list.slice(0, 15);
+}
 
 function loadConfig() {
   try {
@@ -73,6 +84,7 @@ function loadState() {
       api_cursors: raw.api_cursors || { chatgpt: {}, grokbot: {}, gemini_web: {}, claude_ai: {} },
       codex_mtimes: raw.codex_mtimes || {},
       claude_mtimes: raw.claude_mtimes || {},
+      agy_mtimes: raw.agy_mtimes || {},
       health: {
         last_tick_at: null,
         last_success_at: null,
@@ -84,6 +96,7 @@ function loadState() {
         last_cdp_kickstart_at: 0,
         last_error: null,
         per_platform: {},
+        recent_events: [],
         ...(raw.health || {}),
       },
     };
@@ -93,6 +106,7 @@ function loadState() {
       api_cursors: { chatgpt: {}, grokbot: {}, gemini_web: {}, claude_ai: {} },
       codex_mtimes: {},
       claude_mtimes: {},
+      agy_mtimes: {},
       health: {
         last_tick_at: null,
         last_success_at: null,
@@ -104,6 +118,7 @@ function loadState() {
         last_cdp_kickstart_at: 0,
         last_error: null,
         per_platform: {},
+        recent_events: [],
       },
     };
   }
@@ -298,7 +313,11 @@ async function extractGrokTabFn(sid) {
           const loaded = await lRes.json();
           turns = (loaded.responses || [])
             .filter((r) => r.message)
-            .map((r) => ({ role: r.sender === 'human' ? 'user' : 'assistant', text: String(r.message).trim() }))
+            .map((r) => ({
+              role: r.sender === 'human' ? 'user' : 'assistant',
+              text: String(r.message).trim(),
+              at: r.createTime ? Date.parse(r.createTime) / 1000 : null,
+            }))
             .filter((t) => t.text);
         }
       }
@@ -338,7 +357,7 @@ async function extractChatGptTabFn(sid) {
             const ctype = m?.content?.content_type;
             if (!['thoughts', 'reasoning_recap'].includes(ctype) && Array.isArray(m?.content?.parts)) {
               const text = m.content.parts.filter((p) => typeof p === 'string').join('\n').trim();
-              if (text) turns.push({ role, text });
+              if (text) turns.push({ role, text, at: typeof m?.create_time === 'number' ? m.create_time : null });
             }
           }
           n = conv.mapping[n].parent;
@@ -379,6 +398,7 @@ async function extractClaudeAiTabFn(sid) {
           .map((m) => ({
             role: m.sender === 'human' ? 'user' : 'assistant',
             text: String(m.text || (m.content || []).map((c) => c.text || '').join('\n')).trim(),
+            at: m.created_at ? Date.parse(m.created_at) / 1000 : null,
           }))
           .filter((t) => t.text);
       }
@@ -634,9 +654,11 @@ async function handleWebCandidate(state, cfg, candidate, isColdStart) {
   state.health.ai_calls = (state.health.ai_calls || 0) + 1;
   const res = await runPythonGuardian(['review-job', '--host', host], {
     session_id: sid,
+    title,
     prompt,
     result: summary.lastAsst.text.trim(),
     evidence,
+    turns: summary.cleanTurns.slice(-24).map((t) => ({ role: t.role, text: t.text.slice(0, 1200), at: t.at || null })),
     session_url: url,
     project: title,
   });
@@ -660,6 +682,11 @@ async function handleWebCandidate(state, cfg, candidate, isColdStart) {
   log(`[review] ${key} status=${res.status} err=${res.model_error?.category || 'none'} title=${JSON.stringify(title.slice(0, 40))}`);
 
   const correction = res.hook_output?.reason || res.hook_output?.hookSpecificOutput?.additionalContext || '';
+  if (correction) {
+    recordWatcherEvent(state, 'review', `${host}:${sid.slice(0, 12)} prompt (${title.slice(0, 60)})`);
+  } else if (res.model_error?.category) {
+    recordWatcherEvent(state, 'error', `${host}:${sid.slice(0, 12)} ${res.model_error.category}`);
+  }
   if (!correction) return;
 
   notifyMac(`Intent Guardian (${host})`, res.last_review?.decision?.reason || correction.slice(0, 140));
@@ -693,6 +720,7 @@ async function handleWebCandidate(state, cfg, candidate, isColdStart) {
     state.seen[key].auto_sent_count = autoCount + 1;
     state.seen[key].last_sent_at = Date.now();
     state.health.deliveries = (state.health.deliveries || 0) + 1;
+    recordWatcherEvent(state, 'delivered', `${host}:${sid.slice(0, 12)} via ${sent.method}`);
     await recordDelivery(host, sid, res.feedback_hash, `cdp-dom:${sent.method}`);
     log(`[delivered] ${key} via ${sent.method}`);
   } else {
@@ -770,7 +798,7 @@ async function sweepBackgroundWebApis(state, cfg, tabs, openKeys, isColdStart) {
               const ctype = m?.content?.content_type;
               if (!['thoughts', 'reasoning_recap'].includes(ctype) && Array.isArray(m?.content?.parts)) {
                 const text = m.content.parts.filter((p) => typeof p === 'string').join('\n').trim();
-                if (text) turns.push({ role, text });
+                if (text) turns.push({ role, text, at: typeof m?.create_time === 'number' ? m.create_time : null });
               }
             }
             n = conv.mapping[n].parent;
@@ -830,7 +858,11 @@ async function sweepBackgroundWebApis(state, cfg, tabs, openKeys, isColdStart) {
         }).then((r) => (r.ok ? r.json() : {}));
         const turns = (loaded.responses || [])
           .filter((r) => r.message)
-          .map((r) => ({ role: r.sender === 'human' ? 'user' : 'assistant', text: String(r.message).trim() }))
+          .map((r) => ({
+            role: r.sender === 'human' ? 'user' : 'assistant',
+            text: String(r.message).trim(),
+            at: r.createTime ? Date.parse(r.createTime) / 1000 : null,
+          }))
           .filter((t) => t.text);
         state.api_cursors.grokbot[sid] = mod;
         await handleWebCandidate(state, cfg, {
@@ -872,7 +904,7 @@ async function sweepBackgroundWebApis(state, cfg, tabs, openKeys, isColdStart) {
     }
   }
 
-  // 4. Claude.ai background sweep via any open Claude.ai tab (bypasses Cloudflare)
+  // 4. Claude.ai background sweep via open tab (Cloudflare bypass) or direct cookie probe
   const claudeTab = tabs.find((t) => t.url.startsWith('https://claude.ai/'));
   if (claudeTab) {
     const res = await evalIn(claudeTab.webSocketDebuggerUrl, `(async () => {
@@ -899,6 +931,7 @@ async function sweepBackgroundWebApis(state, cfg, tabs, openKeys, isColdStart) {
           .map((m) => ({
             role: m.sender === 'human' ? 'user' : 'assistant',
             text: String(m.text || (m.content || []).map((c) => c.text || '').join('\n')).trim(),
+            at: m.created_at ? Date.parse(m.created_at) / 1000 : null,
           }))
           .filter((t) => t.text);
         state.api_cursors.claude_ai[it.uuid] = it.updated_at;
@@ -913,6 +946,72 @@ async function sweepBackgroundWebApis(state, cfg, tabs, openKeys, isColdStart) {
           updatedAtMs: updMs,
           tab: null,
         }, isColdStart);
+      }
+    }
+  } else {
+    const ck = cookieHeader(cookies, 'claude.ai');
+    if (ck) {
+      try {
+        const orgRes = await fetch('https://claude.ai/api/organizations', {
+          headers: { cookie: ck, 'user-agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (orgRes.ok) {
+          const orgs = await orgRes.json();
+          const orgId = Array.isArray(orgs) && orgs[0]?.uuid;
+          if (orgId) {
+            const listRes = await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations?limit=5`, {
+              headers: { cookie: ck, 'user-agent': 'Mozilla/5.0' },
+              signal: AbortSignal.timeout(5000),
+            });
+            const items = listRes.ok ? (await listRes.json()).slice(0, 5) : [];
+            state.health.per_platform.claude_ai = { last_checked: new Date().toISOString(), recent_count: items.length };
+            for (const it of items) {
+              const updMs = Date.parse(it.updated_at || '');
+              if (!it.uuid || !updMs || now - updMs > RECENT_WEB_MS) continue;
+              const key = `claude_ai:${it.uuid}`;
+              if (openKeys.has(key)) continue;
+              if (state.api_cursors.claude_ai[it.uuid] === it.updated_at && state.seen[key]?.reviewed_digest) continue;
+              const cRes = await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations/${it.uuid}?tree=True&rendering_mode=messages&consistency=strong`, {
+                headers: { cookie: ck, 'user-agent': 'Mozilla/5.0' },
+                signal: AbortSignal.timeout(6000),
+              });
+              const conv = cRes.ok ? await cRes.json() : null;
+              if (!conv) continue;
+              const turns = (conv.chat_messages || [])
+                .map((m) => ({
+                  role: m.sender === 'human' ? 'user' : 'assistant',
+                  text: String(m.text || (m.content || []).map((c) => c.text || '').join('\n')).trim(),
+                  at: m.created_at ? Date.parse(m.created_at) / 1000 : null,
+                }))
+                .filter((t) => t.text);
+              state.api_cursors.claude_ai[it.uuid] = it.updated_at;
+              await handleWebCandidate(state, cfg, {
+                host: 'claude_ai',
+                sid: it.uuid,
+                title: conv.name || it.name || 'Claude.ai',
+                url: `https://claude.ai/chat/${it.uuid}`,
+                streaming: false,
+                composer_empty: false,
+                turns,
+                updatedAtMs: updMs,
+                tab: null,
+              }, isColdStart);
+            }
+          }
+        } else {
+          state.health.per_platform.claude_ai = {
+            ...(state.health.per_platform.claude_ai || {}),
+            last_checked: new Date().toISOString(),
+            note: 'open_tab_required',
+          };
+        }
+      } catch {
+        state.health.per_platform.claude_ai = {
+          ...(state.health.per_platform.claude_ai || {}),
+          last_checked: new Date().toISOString(),
+          note: 'open_tab_required',
+        };
       }
     }
   }
@@ -1081,6 +1180,7 @@ async function sweepBrokenCwdCodex(state, cfg) {
 
     const correction = res.hook_output?.reason || '';
     if (correction) {
+      recordWatcherEvent(state, info.brokenCwd ? 'codex-broken-cwd' : 'codex-missed-stop', `codex:${info.sid.slice(0, 12)} prompted`);
       notifyMac('Intent Guardian (codex)', res.last_review?.decision?.reason || correction.slice(0, 140));
       const key = `codex:${info.sid}`;
       const prev = state.seen[key] || {};
@@ -1089,6 +1189,7 @@ async function sweepBrokenCwdCodex(state, cfg) {
           await sendCodexTurn(info.sid, correction);
           state.seen[key] = { ...prev, auto_sent_count: (prev.auto_sent_count || 0) + 1, last_sent_at: Date.now() };
           state.health.deliveries = (state.health.deliveries || 0) + 1;
+          recordWatcherEvent(state, 'delivered', `codex:${info.sid.slice(0, 12)} via app-server`);
           await recordDelivery('codex', info.sid, res.feedback_hash, 'codex-app-server');
           log(`[codex-delivered] sid=${info.sid} via app-server turn/start`);
         } catch (e) {
@@ -1188,10 +1289,94 @@ async function sweepMissedClaudeStops(state, cfg) {
     audited++;
     log(`[claude-missed-stop] sid=${sid} status=${res.status} err=${res.model_error?.category || 'none'}`);
     const corr = res.hook_output?.hookSpecificOutput?.additionalContext || res.hook_output?.reason || '';
-    if (corr) notifyMac('Intent Guardian (claude)', res.last_review?.decision?.reason || corr.slice(0, 140));
+    if (corr) {
+      recordWatcherEvent(state, 'claude-missed-stop', `claude:${sid.slice(0, 12)} prompted`);
+      notifyMac('Intent Guardian (claude)', res.last_review?.decision?.reason || corr.slice(0, 140));
+    }
     if (ONCE && audited >= 1) break;
   }
   state.health.per_platform.claude = { last_checked: new Date().toISOString(), audited_last_tick: audited };
+}
+
+function inspectAntigravityJsonl(filePath) {
+  const raw = readFileSync(filePath, 'utf8');
+  const lines = raw.split('\n').filter(Boolean);
+  let hasUser = false;
+  let lastMeaningful = null;
+  let isSubagent = false;
+  for (const line of lines.slice(0, 8)) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row.type === 'USER_INPUT') { hasUser = true; break; }
+    if (row.type === 'SYSTEM_MESSAGE' && typeof row.content === 'string' && /\[Message\]\s+timestamp=\S+\s+sender=[0-9a-f-]{8,}/i.test(row.content)) {
+      isSubagent = true;
+    }
+  }
+  if (isSubagent && !hasUser) return false;
+  for (const line of lines.slice(-40)) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row.type === 'USER_INPUT') {
+      hasUser = true;
+      lastMeaningful = { type: 'user' };
+    } else if (row.type === 'PLANNER_RESPONSE') {
+      const hasCalls = Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+      const hasText = typeof row.content === 'string' && row.content.trim().length > 0;
+      lastMeaningful = { type: 'planner', stoppedCleanly: hasText && !hasCalls };
+    } else if (row.type === 'GENERIC') {
+      lastMeaningful = { type: 'tool' };
+    }
+  }
+  return Boolean(hasUser && lastMeaningful?.type === 'planner' && lastMeaningful.stoppedCleanly);
+}
+
+async function sweepMissedAntigravityStops(state, cfg) {
+  if (!existsSync(AGY_BRAIN_DIR)) return;
+  const now = Date.now();
+  const candidates = [];
+  for (const sid of readdirSync(AGY_BRAIN_DIR)) {
+    const filePath = join(AGY_BRAIN_DIR, sid, '.system_generated', 'logs', 'transcript.jsonl');
+    if (!existsSync(filePath)) continue;
+    try {
+      const st = statSync(filePath);
+      if (now - st.mtimeMs <= RECENT_CODEX_MS) {
+        candidates.push({ filePath, mtimeMs: st.mtimeMs, sid });
+      }
+    } catch {}
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let audited = 0;
+  for (const { filePath, mtimeMs, sid } of candidates) {
+    if (!ONCE && now - mtimeMs < 60_000) continue;
+    if (state.agy_mtimes[filePath] === mtimeMs) continue;
+    const lastSeenMs = guardianStateLastSeenMs('antigravity', sid);
+    if (lastSeenMs && mtimeMs <= lastSeenMs + 45_000) {
+      state.agy_mtimes[filePath] = mtimeMs;
+      continue;
+    }
+    if (SEED_ONLY || !inspectAntigravityJsonl(filePath)) {
+      state.agy_mtimes[filePath] = mtimeMs;
+      continue;
+    }
+    state.health.ai_calls = (state.health.ai_calls || 0) + 1;
+    const res = await runPythonGuardian([
+      'audit',
+      '--host', 'antigravity',
+      '--session-id', sid,
+      '--transcript', filePath,
+      '--event', 'Stop',
+    ]);
+    state.agy_mtimes[filePath] = mtimeMs;
+    audited++;
+    log(`[agy-missed-stop] sid=${sid} status=${res.status} err=${res.model_error?.category || 'none'}`);
+    const corr = res.hook_output?.reason || '';
+    if (corr) {
+      recordWatcherEvent(state, 'agy-missed-stop', `antigravity:${sid.slice(0, 12)} prompted`);
+      notifyMac('Intent Guardian (antigravity)', res.last_review?.decision?.reason || corr.slice(0, 140));
+    }
+    if (ONCE && audited >= 1) break;
+  }
+  state.health.per_platform.antigravity = { last_checked: new Date().toISOString(), audited_last_tick: audited };
 }
 
 async function tick(state) {
@@ -1219,6 +1404,7 @@ async function tick(state) {
           stdio: 'ignore',
         });
         state.health.last_cdp_kickstart_at = Date.now();
+        recordWatcherEvent(state, 'cdp-self-heal', `kickstarted chrome-agent after ${state.health.cdp_fails} fails`);
         log(`[cdp-self-heal] kickstarted com.sami.chrome-agent after ${state.health.cdp_fails} failures`);
       } catch {}
     }
@@ -1246,9 +1432,10 @@ async function tick(state) {
     }
   }
 
-  // 2. Broken-cwd & missed-Stop Codex rollouts + missed-Stop Claude Code transcripts
+  // 2. Broken-cwd & missed-Stop local sessions (Codex, Claude Code, Antigravity)
   await sweepBrokenCwdCodex(state, cfg);
   await sweepMissedClaudeStops(state, cfg);
+  await sweepMissedAntigravityStops(state, cfg);
 
   state.health.last_success_at = new Date().toISOString();
   state.health.last_error = null;
@@ -1295,6 +1482,7 @@ async function main() {
       } catch (e) {
         state.health.fails = (state.health.fails || 0) + 1;
         state.health.last_error = String(e.message || e).slice(0, 200);
+        recordWatcherEvent(state, 'error', state.health.last_error);
         log('[tick-error]', state.health.last_error);
         saveState(state);
       } finally {
