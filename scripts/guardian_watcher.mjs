@@ -41,7 +41,7 @@ const ONCE = ARGS.has('--once');
 const NO_DELIVER = ARGS.has('--no-deliver');
 const SEED_ONLY = ARGS.has('--seed-only');
 
-const WATCHER_VERSION = '1.9.0';
+const WATCHER_VERSION = '2.0.0';
 const GUARDIAN_TAG = "[SAMI'S INTENT GUARDIAN]";
 const DEFAULT_INTERVAL_MS = 15_000;
 const STABLE_MS = 10_000;
@@ -51,6 +51,7 @@ const MAX_AUTO_CODEX_PER_USER_TURN = 2;
 const RECENT_WEB_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const RECENT_CODEX_MS = ONCE ? 6 * 3600_000 : 30 * 60_000;
 const COLD_SEED_AGE_MS = 5 * 60_000;
+const CLAUDE_PROJECTS_DIR = join(HOME, '.claude', 'projects');
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -71,6 +72,7 @@ function loadState() {
       seen: raw.seen || {},
       api_cursors: raw.api_cursors || { chatgpt: {}, grokbot: {}, gemini_web: {}, claude_ai: {} },
       codex_mtimes: raw.codex_mtimes || {},
+      claude_mtimes: raw.claude_mtimes || {},
       health: {
         last_tick_at: null,
         last_success_at: null,
@@ -79,6 +81,7 @@ function loadState() {
         deliveries: 0,
         fails: 0,
         cdp_fails: 0,
+        last_cdp_kickstart_at: 0,
         last_error: null,
         per_platform: {},
         ...(raw.health || {}),
@@ -89,6 +92,7 @@ function loadState() {
       seen: {},
       api_cursors: { chatgpt: {}, grokbot: {}, gemini_web: {}, claude_ai: {} },
       codex_mtimes: {},
+      claude_mtimes: {},
       health: {
         last_tick_at: null,
         last_success_at: null,
@@ -97,6 +101,7 @@ function loadState() {
         deliveries: 0,
         fails: 0,
         cdp_fails: 0,
+        last_cdp_kickstart_at: 0,
         last_error: null,
         per_platform: {},
       },
@@ -939,6 +944,16 @@ function recentCodexSessionFiles() {
   return results;
 }
 
+function guardianStateLastSeenMs(host, sid) {
+  try {
+    const key = sha(`[${JSON.stringify(host)}, ${JSON.stringify(sid)}]`).slice(0, 32);
+    const raw = JSON.parse(readFileSync(join(STATE_DIR, `${key}.json`), 'utf8'));
+    return (Number(raw.last_seen) || 0) * 1000;
+  } catch {
+    return 0;
+  }
+}
+
 function inspectCodexRollout(filePath) {
   const raw = readFileSync(filePath, 'utf8');
   const lines = raw.split('\n').filter(Boolean);
@@ -952,7 +967,7 @@ function inspectCodexRollout(filePath) {
   const src = pl.source;
   const isSubagent = pl.thread_source === 'subagent' || (src && typeof src === 'object' && 'subagent' in src);
   if (!sid || isSubagent) return null;
-  if (cwd && existsSync(cwd)) return null; // Native Codex hooks handle existing cwds
+  const brokenCwd = !(cwd && existsSync(cwd));
 
   let lastUserLine = -1;
   let lastDoneLine = -1;
@@ -990,7 +1005,7 @@ function inspectCodexRollout(filePath) {
     }
   }
   if (!userCount || lastTaskStart > lastTaskEnd || lastDoneLine <= lastUserLine) return null;
-  return { sid, cwd, userCount };
+  return { sid, cwd, brokenCwd, userCount };
 }
 
 async function sweepBrokenCwdCodex(state, cfg) {
@@ -1043,6 +1058,14 @@ async function sweepBrokenCwdCodex(state, cfg) {
       state.codex_mtimes[filePath] = mtimeMs;
       continue;
     }
+    if (!info.brokenCwd) {
+      if (!ONCE && now - mtimeMs < 45_000) continue; // give native Stop hook time to run first
+      const lastSeenMs = guardianStateLastSeenMs('codex', info.sid);
+      if (lastSeenMs && mtimeMs <= lastSeenMs + 30_000) {
+        state.codex_mtimes[filePath] = mtimeMs;
+        continue;
+      }
+    }
 
     state.health.ai_calls = (state.health.ai_calls || 0) + 1;
     const res = await runPythonGuardian([
@@ -1054,7 +1077,7 @@ async function sweepBrokenCwdCodex(state, cfg) {
     ]);
     state.codex_mtimes[filePath] = mtimeMs;
     audited++;
-    log(`[codex-broken-cwd] sid=${info.sid} status=${res.status} err=${res.model_error?.category || 'none'}`);
+    log(`[${info.brokenCwd ? 'codex-broken-cwd' : 'codex-missed-stop'}] sid=${info.sid} status=${res.status} err=${res.model_error?.category || 'none'}`);
 
     const correction = res.hook_output?.reason || '';
     if (correction) {
@@ -1096,6 +1119,81 @@ async function sweepBrokenCwdCodex(state, cfg) {
   state.health.per_platform.codex_broken_cwd = { last_checked: new Date().toISOString(), audited_last_tick: audited };
 }
 
+function inspectClaudeJsonl(filePath) {
+  const raw = readFileSync(filePath, 'utf8');
+  const lines = raw.split('\n').filter(Boolean);
+  let hasUser = false;
+  let lastRole = null;
+  for (const line of lines.slice(-60)) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row.isSidechain || row.isMeta) continue;
+    const t = row.type;
+    if (t === 'user') {
+      const c = row.message?.content;
+      const isToolOnly = Array.isArray(c) && c.length && c.every((x) => x && x.type === 'tool_result');
+      if (!isToolOnly) {
+        hasUser = true;
+        lastRole = 'user';
+      }
+    } else if (t === 'assistant') {
+      lastRole = 'assistant';
+    }
+  }
+  return hasUser && lastRole === 'assistant';
+}
+
+async function sweepMissedClaudeStops(state, cfg) {
+  if (!existsSync(CLAUDE_PROJECTS_DIR)) return;
+  const now = Date.now();
+  const candidates = [];
+  for (const proj of readdirSync(CLAUDE_PROJECTS_DIR)) {
+    const dir = join(CLAUDE_PROJECTS_DIR, proj);
+    let entries;
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const name of entries) {
+      if (!name.endsWith('.jsonl') || name.startsWith('agent-')) continue;
+      const filePath = join(dir, name);
+      try {
+        const st = statSync(filePath);
+        if (now - st.mtimeMs <= RECENT_CODEX_MS) {
+          candidates.push({ filePath, mtimeMs: st.mtimeMs, sid: name.slice(0, -6) });
+        }
+      } catch {}
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let audited = 0;
+  for (const { filePath, mtimeMs, sid } of candidates) {
+    if (!ONCE && now - mtimeMs < 45_000) continue;
+    if (state.claude_mtimes[filePath] === mtimeMs) continue;
+    const lastSeenMs = guardianStateLastSeenMs('claude', sid);
+    if (lastSeenMs && mtimeMs <= lastSeenMs + 30_000) {
+      state.claude_mtimes[filePath] = mtimeMs;
+      continue;
+    }
+    if (SEED_ONLY || !inspectClaudeJsonl(filePath)) {
+      state.claude_mtimes[filePath] = mtimeMs;
+      continue;
+    }
+    state.health.ai_calls = (state.health.ai_calls || 0) + 1;
+    const res = await runPythonGuardian([
+      'audit',
+      '--host', 'claude',
+      '--session-id', sid,
+      '--transcript', filePath,
+      '--event', 'Stop',
+    ]);
+    state.claude_mtimes[filePath] = mtimeMs;
+    audited++;
+    log(`[claude-missed-stop] sid=${sid} status=${res.status} err=${res.model_error?.category || 'none'}`);
+    const corr = res.hook_output?.hookSpecificOutput?.additionalContext || res.hook_output?.reason || '';
+    if (corr) notifyMac('Intent Guardian (claude)', res.last_review?.decision?.reason || corr.slice(0, 140));
+    if (ONCE && audited >= 1) break;
+  }
+  state.health.per_platform.claude = { last_checked: new Date().toISOString(), audited_last_tick: audited };
+}
+
 async function tick(state) {
   rotateLogIfLarge();
   const cfg = loadConfig();
@@ -1114,6 +1212,16 @@ async function tick(state) {
   } catch (e) {
     state.health.cdp_fails = (state.health.cdp_fails || 0) + 1;
     if (state.health.cdp_fails % 5 === 1) log(`[cdp-warn] Chrome CDP unavailable: ${e.message}`);
+    if (!ONCE && state.health.cdp_fails >= 5 && Date.now() - (state.health.last_cdp_kickstart_at || 0) > 600_000) {
+      try {
+        execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${process.getuid()}/com.sami.chrome-agent`], {
+          timeout: 5000,
+          stdio: 'ignore',
+        });
+        state.health.last_cdp_kickstart_at = Date.now();
+        log(`[cdp-self-heal] kickstarted com.sami.chrome-agent after ${state.health.cdp_fails} failures`);
+      } catch {}
+    }
   }
 
   if (cdpOk) {
@@ -1138,8 +1246,9 @@ async function tick(state) {
     }
   }
 
-  // 2. Broken-cwd Codex rollouts
+  // 2. Broken-cwd & missed-Stop Codex rollouts + missed-Stop Claude Code transcripts
   await sweepBrokenCwdCodex(state, cfg);
+  await sweepMissedClaudeStops(state, cfg);
 
   state.health.last_success_at = new Date().toISOString();
   state.health.last_error = null;

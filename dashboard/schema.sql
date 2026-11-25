@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS events (
   outcome TEXT,
   project TEXT,
   session_url TEXT,
-  session_state TEXT
+  session_state TEXT,
+  title TEXT
 );
 CREATE INDEX IF NOT EXISTS events_recent ON events(at DESC);
 CREATE INDEX IF NOT EXISTS events_host_sid ON events(host, session_id, at DESC);

@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 
 const hosts = ["codex", "claude", "antigravity", "chatgpt", "claude_ai", "gemini_web", "grokbot", "cowork"];
-const kinds = ["seen", "correction", "delivered", "outcome", "error", "manual_followup"];
+const kinds = ["seen", "correction", "delivered", "outcome", "error", "manual_followup", "turn_user", "turn_assistant"];
 const labels = {
   codex: "Codex",
   claude: "Claude Code",
@@ -15,7 +15,7 @@ const labels = {
   grokbot: "Grok",
   cowork: "Cowork",
 };
-const maxBodyLength = 120_000;
+const maxBodyLength = 240_000;
 
 function response(body, status = 200, headers = {}, csp = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'") {
   return new Response(body, {
@@ -79,6 +79,9 @@ function normalize(event, importing = false) {
   const project = typeof event.project === "string"
     ? event.project.replace(/[^\p{L}\p{N} .@+\-_:/()–—]/gu, "").trim().slice(0, 80) || null
     : null;
+  const title = typeof event.title === "string"
+    ? event.title.replace(/[^\p{L}\p{N} .@+\-_:/()–—?!,'"]/gu, "").trim().slice(0, 100) || null
+    : null;
   const sessionUrl = safeUrl(event.session_url);
   const sessionState = ["ongoing", "completed", "pending", "error", "stopped"].includes(event.session_state)
     ? event.session_state
@@ -94,6 +97,7 @@ function normalize(event, importing = false) {
     project,
     sessionUrl,
     sessionState,
+    title,
   ];
 }
 
@@ -127,7 +131,7 @@ async function ingest(request, database, feedAuthorization) {
   } catch {
     return response("Invalid JSON", 400);
   }
-  if (!events.length || events.length > 40 || events.includes(null)) return response("Invalid events", 400);
+  if (!events.length || events.length > 80 || events.includes(null)) return response("Invalid events", 400);
   writeEvents(database, events);
   return response(JSON.stringify({ accepted: events.length }), 200, { "Content-Type": "application/json" });
 }
@@ -164,15 +168,16 @@ async function ingestWatcher(request, database, feedAuthorization) {
 
 function writeEvents(database, events) {
   const statement = database.prepare(`
-    INSERT INTO events (id, host, session_id, kind, at, message, outcome, project, session_url, session_state)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO events (id, host, session_id, kind, at, message, outcome, project, session_url, session_state, title)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       at = excluded.at,
       message = excluded.message,
       outcome = excluded.outcome,
       project = COALESCE(excluded.project, events.project),
       session_url = COALESCE(excluded.session_url, events.session_url),
-      session_state = COALESCE(excluded.session_state, events.session_state)
+      session_state = COALESCE(excluded.session_state, events.session_state),
+      title = COALESCE(excluded.title, events.title)
     WHERE excluded.at >= events.at AND excluded.host = events.host
       AND excluded.session_id = events.session_id AND excluded.kind = events.kind
   `);
@@ -191,21 +196,27 @@ function queryState(database) {
   const seenRows = database.prepare(`
     SELECT host, session_id, MAX(at) AS last_at,
       MAX(project) AS project,
+      MAX(title) AS title,
       MAX(session_url) AS session_url,
       (SELECT s2.session_state FROM events s2
         WHERE s2.host = events.host AND s2.session_id = events.session_id AND s2.session_state IS NOT NULL
-        ORDER BY s2.at DESC LIMIT 1) AS session_state
+        ORDER BY s2.at DESC LIMIT 1) AS session_state,
+      SUM(CASE WHEN kind = 'correction' THEN 1 ELSE 0 END) AS corrections_count,
+      SUM(CASE WHEN kind = 'delivered' THEN 1 ELSE 0 END) AS delivered_count,
+      SUM(CASE WHEN kind = 'manual_followup' THEN 1 ELSE 0 END) AS manual_count,
+      SUM(CASE WHEN kind = 'error' THEN 1 ELSE 0 END) AS error_count,
+      SUM(CASE WHEN kind IN ('turn_user', 'turn_assistant') THEN 1 ELSE 0 END) AS turn_count
     FROM events
     GROUP BY host, session_id
     ORDER BY last_at DESC
     LIMIT 250
   `).all();
   const detailRows = database.prepare(`
-    SELECT id, host, session_id, kind, at, message, outcome, project, session_url, session_state
+    SELECT id, host, session_id, kind, at, message, outcome, project, session_url, session_state, title
     FROM events
-    WHERE kind <> 'seen'
+    WHERE kind NOT IN ('seen', 'turn_user', 'turn_assistant')
     ORDER BY at DESC
-    LIMIT 800
+    LIMIT 1000
   `).all();
   const heartbeat = database.prepare("SELECT host, MAX(at) AS at, COUNT(DISTINCT session_id) AS sessions FROM events GROUP BY host").all();
   const watcherRow = database.prepare("SELECT updated_at, payload FROM watcher_health WHERE id = 'primary'").get();
@@ -259,7 +270,7 @@ function queryState(database) {
     SELECT host, kind, outcome, COUNT(*) AS cnt,
       SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS cnt24
     FROM events
-    WHERE kind <> 'seen'
+    WHERE kind NOT IN ('seen', 'turn_user', 'turn_assistant')
     GROUP BY host, kind, outcome
   `).all(now - 86400);
 
@@ -299,7 +310,7 @@ function queryState(database) {
   }
 
   const manualRows = database.prepare(`
-    SELECT host, session_id, project, session_url, at, message
+    SELECT host, session_id, project, title, session_url, at, message
     FROM events
     WHERE kind = 'manual_followup'
     ORDER BY at DESC
@@ -315,7 +326,7 @@ function queryState(database) {
     return {
       host: r.host,
       session_id: r.session_id,
-      project: r.project,
+      project: r.title || r.project,
       session_url: r.session_url,
       at: r.at,
       category,
@@ -336,6 +347,22 @@ function queryState(database) {
     },
     sessions: seenRows,
     events: detailRows,
+  };
+}
+
+function querySession(database, host, sessionId) {
+  const rows = database.prepare(`
+    SELECT id, host, session_id, kind, at, message, outcome, project, session_url, session_state, title
+    FROM events
+    WHERE host = ? AND session_id = ? AND kind <> 'seen'
+    ORDER BY at ASC
+    LIMIT 400
+  `).all(host, sessionId);
+  return {
+    host,
+    session_id: sessionId,
+    serverTime: Date.now() / 1000,
+    events: rows,
   };
 }
 
@@ -367,8 +394,9 @@ function clientApp() {
 
   let state = { serverTime: Date.now() / 1000, watcher: null, metrics: null, sessions: [], events: [] };
   let sessions = [], filtered = [];
-  let fHost = "all", fState = "all", fProject = "all";
-  let selKey = null, selIdx = -1, viewMode = "session";
+  let fScope = "prompted", fHost = "all", fState = "all", fProject = "all";
+  let selKey = null, selIdx = -1, viewMode = "session", chatMode = "prompts";
+  const sessionCache = new Map();
 
   const relTime = (ts) => {
     if (!ts) return "";
@@ -389,6 +417,15 @@ function clientApp() {
     if (host === "claude") return "claude --resume " + sid;
     if (host === "antigravity") return "agy --conversation " + sid;
     return url || sid;
+  }
+
+  function cleanPreview(msg) {
+    if (!msg) return "";
+    let t = String(msg).replace(/^\[SAMI'S INTENT GUARDIAN\]\s*(?:DO NOT STOP[^\n]*\n)?/i, "");
+    const gap = (t.match(/(?:^|\n)Gap:\s*([^\n]+)/i) || [])[1];
+    if (gap) return gap.trim();
+    t = t.replace(/^\[([a-z0-9_]+)\]\s*/i, "");
+    return t.replace(/\s+/g, " ").trim();
   }
 
   function deriveStatus(s, evs, now) {
@@ -412,21 +449,26 @@ function clientApp() {
     for (const ev of state.events || []) {
       const key = ev.host + ":" + ev.session_id;
       if (!byKey.has(key)) {
-        byKey.set(key, { key, host: ev.host, session_id: ev.session_id, last_at: ev.at, project: ev.project, session_url: ev.session_url, session_state: ev.session_state, events: [] });
+        byKey.set(key, { key, host: ev.host, session_id: ev.session_id, last_at: ev.at, project: ev.project, title: ev.title, session_url: ev.session_url, session_state: ev.session_state, events: [] });
       }
       const obj = byKey.get(key);
       obj.events.push(ev);
       if (!obj.project && ev.project) obj.project = ev.project;
+      if (!obj.title && ev.title) obj.title = ev.title;
       if (!obj.session_url && ev.session_url) obj.session_url = ev.session_url;
       if (ev.at > (obj.last_at || 0)) obj.last_at = ev.at;
     }
     sessions = [...byKey.values()].map((s) => {
-      s.events.sort((a, b) => b.at - a.at);
+      s.events.sort((a, b) => a.at - b.at);
       s.status = deriveStatus(s, s.events, now);
-      s.corrections = s.events.filter((e) => e.kind === "correction").length;
-      s.deliveredCount = s.events.filter((e) => e.kind === "delivered").length;
-      s.manualCount = s.events.filter((e) => e.kind === "manual_followup").length;
-      s.latestMsg = (s.events.find((e) => e.message) || {}).message || "";
+      s.corrections = Math.max(Number(s.corrections_count || 0), s.events.filter((e) => e.kind === "correction").length);
+      s.deliveredCount = Math.max(Number(s.delivered_count || 0), s.events.filter((e) => e.kind === "delivered").length);
+      s.manualCount = Math.max(Number(s.manual_count || 0), s.events.filter((e) => e.kind === "manual_followup").length);
+      s.errorCount = Math.max(Number(s.error_count || 0), s.events.filter((e) => e.kind === "error").length);
+      s.turnCount = Number(s.turn_count || 0);
+      const rev = [...s.events].reverse();
+      s.latestMsg = (rev.find((e) => e.kind === "correction" && e.message) || rev.find((e) => e.message) || {}).message || "";
+      s.isPrompted = s.corrections > 0 || s.manualCount > 0 || s.errorCount > 0 || s.status === "pending" || s.status === "error";
       return s;
     }).sort((a, b) => (b.last_at || 0) - (a.last_at || 0));
   }
@@ -436,38 +478,38 @@ function clientApp() {
     const wb = $("watcherBar");
     if (!w) {
       wb.className = "watcher-pill offline";
-      wb.innerHTML = '<i></i><span>Watcher · awaiting first v1.8+ heartbeat</span>';
+      wb.innerHTML = '<i></i><span>Watcher · awaiting heartbeat</span>';
     } else {
       const live = Boolean(w.alive);
       wb.className = `watcher-pill ${live ? "on" : "stale"}`;
-      wb.innerHTML = `<i></i><span>Watcher v${esc(w.version || "?")} · ${live ? "Live" : "Stale"} ${esc(ageLabel(w.age_sec))} · ${w.auto_deliver ? "Auto-Deliver ON" : "Observe"} · ${esc(w.ticks ?? 0)} ticks · ${esc(w.deliveries ?? 0)} delivered</span>`;
+      wb.innerHTML = `<i></i><span>Watcher v${esc(w.version || "?")} · ${live ? "Live" : "Stale"} ${esc(ageLabel(w.age_sec))} · ${w.auto_deliver ? "Auto-Deliver ON" : "Observe"} · ${esc(w.ticks ?? 0)} ticks · ${esc(w.deliveries ?? 0)} deliv</span>`;
     }
 
     const m = state.metrics || {};
-    const corr = m.corrections ?? 0;
-    const deliv = m.delivered ?? 0;
-    const ver = m.verified ?? 0;
-    const sup = m.superseded ?? 0;
-    const man = m.manual_followups ?? 0;
-    const err = m.errors ?? 0;
     $("kpiGrid").innerHTML = `
-      <div class="kpi"><div class="kv">${corr}</div><div class="kl">Guardian Prompts</div><div class="ks">${deliv} delivered · ${m.pending ?? 0} open</div></div>
-      <div class="kpi"><div class="kv">${ver}</div><div class="kl">Verified Closed</div><div class="ks">${sup} superseded</div></div>
-      <button class="kpi kpi-btn${fState === "manual" ? " on" : ""}" data-kpi="manual"><div class="kv">${man}</div><div class="kl">Manual Follow-Ups</div><div class="ks">after Guardian</div></button>
-      <button class="kpi kpi-btn${fState === "error" ? " on" : ""}" data-kpi="error"><div class="kv">${err}</div><div class="kl">Observer Errors</div><div class="ks">${m.last_24h?.errors ?? 0} in 24h</div></button>
+      <div class="kpi"><div class="kv">${m.corrections ?? 0}</div><div class="kl">Guardian Prompts</div><div class="ks">${m.delivered ?? 0} delivered · ${m.pending ?? 0} open</div></div>
+      <div class="kpi"><div class="kv">${m.verified ?? 0}</div><div class="kl">Verified Closed</div><div class="ks">${m.superseded ?? 0} superseded</div></div>
+      <button class="kpi kpi-btn${fState === "manual" ? " on" : ""}" data-kpi="manual"><div class="kv">${m.manual_followups ?? 0}</div><div class="kl">Manual Follow-Ups</div><div class="ks">after Guardian</div></button>
+      <button class="kpi kpi-btn${fState === "error" ? " on" : ""}" data-kpi="error"><div class="kv">${m.errors ?? 0}</div><div class="kl">Observer Errors</div><div class="ks">${m.last_24h?.errors ?? 0} in 24h</div></button>
+    `;
+    const pCnt = sessions.filter((s) => s.isPrompted).length;
+    $("scopeTabs").innerHTML = `
+      <button class="seg-b${fScope === "prompted" ? " on" : ""}" data-scope="prompted">Prompted · ${pCnt}</button>
+      <button class="seg-b${fScope === "all" ? " on" : ""}" data-scope="all">All Monitored · ${sessions.length}</button>
     `;
     $("overviewBtn").classList.toggle("on", viewMode === "overview");
   }
 
   function renderChips() {
-    const activeHosts = HOST_ORDER.filter((h) => sessions.some((s) => s.host === h));
+    const scoped = fScope === "prompted" ? sessions.filter((s) => s.isPrompted) : sessions;
+    const activeHosts = HOST_ORDER.filter((h) => scoped.some((s) => s.host === h));
     if (fHost !== "all" && !activeHosts.includes(fHost)) fHost = "all";
-    const hostItems = [["all", "All", null, sessions.length], ...activeHosts.map((h) => [h, HOST_META[h]?.label || h, HOST_META[h]?.color || "#8E8E93", sessions.filter((s) => s.host === h).length])];
+    const hostItems = [["all", "All", null, scoped.length], ...activeHosts.map((h) => [h, HOST_META[h]?.label || h, HOST_META[h]?.color || "#8E8E93", scoped.filter((s) => s.host === h).length])];
     $("hostChips").innerHTML = hostItems.map(([k, lbl, col, cnt]) =>
       `<button class="chip${fHost === k ? " on" : ""}" data-host="${esc(k)}">${col ? `<span class="d" style="background:${col}"></span>` : ""}${esc(lbl)} <span class="n">${cnt}</span></button>`
     ).join("");
 
-    const baseH = sessions.filter((s) => fHost === "all" || s.host === fHost);
+    const baseH = scoped.filter((s) => fHost === "all" || s.host === fHost);
     const stCounts = {
       all: baseH.length,
       pending: baseH.filter((s) => s.status === "pending").length,
@@ -500,17 +542,19 @@ function clientApp() {
 
   function rowHtml(s, i) {
     const hm = HOST_META[s.host] || { label: s.host, code: s.host.slice(0, 2).toUpperCase(), color: "#8E8E93" };
-    const title = s.project || hm.label;
+    const mainTitle = s.title || s.project || hm.label;
     const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Done", "st-completed"], pending: ["Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
     const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
-    const sub = s.latestMsg ? s.latestMsg.replace(/\[SAMI'S INTENT GUARDIAN\]\s*/g, "") : (s.events.length ? s.events[0].kind : "No corrections · session monitored");
+    const clean = cleanPreview(s.latestMsg);
+    const sub = clean || (s.turnCount ? `${s.turnCount} chat turns · clean` : "Monitored cleanly · no prompts needed");
     const delivBadge = s.deliveredCount ? `<span class="badge-pill st-completed">✓${s.deliveredCount}</span>` : "";
     const manBadge = s.manualCount ? `<span class="badge-pill st-manual">Manual×${s.manualCount}</span>` : "";
+    const projTag = s.project && s.project !== mainTitle ? `<span>· ${esc(s.project.slice(0, 22))}</span>` : "";
     return `<button class="row${viewMode === "session" && s.key === selKey && isWide() ? " sel" : ""}" data-i="${i}">
       <div class="av" style="background:${hm.color}20;color:${hm.color}">${esc(hm.code)}<span class="dot" style="background:${s.status === "ongoing" ? "var(--green)" : s.status === "pending" ? "var(--orange)" : s.status === "error" ? "var(--red)" : "transparent"}"></span></div>
       <div class="rt">
-        <div class="rt-top"><div class="rn">${esc(title)}</div><span class="rt2">${esc(relTime(s.last_at))}</span></div>
-        <div class="rsub"><span>${esc(hm.label)}</span><span>·</span><span style="font-family:var(--mono)">${esc(s.session_id.slice(0, 8))}</span><span class="badge-pill ${stCls}">${esc(stLbl)}</span>${delivBadge}${manBadge}${s.corrections ? `<span>· ${s.corrections}p</span>` : ""}</div>
+        <div class="rt-top"><div class="rn">${esc(mainTitle)}</div><span class="rt2">${esc(relTime(s.last_at))}</span></div>
+        <div class="rsub"><span>${esc(hm.label)}</span>${projTag}<span class="badge-pill ${stCls}">${esc(stLbl)}</span>${delivBadge}${manBadge}${s.corrections ? `<span>· ${s.corrections}p</span>` : ""}</div>
         <div class="rs">${esc(sub)}</div>
       </div>
       <svg class="chev" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l6 6-6 6"/></svg>
@@ -523,10 +567,11 @@ function clientApp() {
     renderChips();
     const q = $("searchInput").value.trim().toLowerCase();
     filtered = sessions.filter((s) =>
+      (fScope === "all" || s.isPrompted) &&
       (fHost === "all" || s.host === fHost) &&
       (fState === "all" || (fState === "manual" ? s.manualCount > 0 : s.status === fState)) &&
       (fProject === "all" || s.project === fProject) &&
-      (!q || [s.session_id, s.host, HOST_META[s.host]?.label, s.project, s.latestMsg].join(" ").toLowerCase().includes(q))
+      (!q || [s.session_id, s.host, HOST_META[s.host]?.label, s.project, s.title, s.latestMsg].join(" ").toLowerCase().includes(q))
     );
     const ongoingN = sessions.filter((s) => s.status === "ongoing").length;
     const pendingN = sessions.filter((s) => s.status === "pending").length;
@@ -546,83 +591,135 @@ function clientApp() {
     let idx = 0;
     $("list").innerHTML = filtered.length
       ? groups.map(([name, arr]) => `<div class="sec">${esc(name)} · ${arr.length}</div><div class="group">${arr.map((s) => rowHtml(s, idx++)).join("")}</div>`).join("")
-      : '<div class="empty">No matching sessions.</div>';
+      : '<div class="empty">No matching sessions. Try switching to "All Monitored".</div>';
 
     if (viewMode === "overview" && isWide()) {
       renderOverview(false);
     } else if (selKey) {
       const k = filtered.findIndex((s) => s.key === selKey);
-      if (k >= 0) { selIdx = k; renderDetail(false); }
+      if (k >= 0) {
+        selIdx = k;
+        renderDetail(false);
+        if (chatMode === "all") fetchSessionDetail(filtered[k], false);
+      }
     } else if (isWide() && filtered.length) {
       openAt(0);
     }
   }
 
   function parseCorrectionParts(msg) {
-    const clean = msg.replace(/^\[SAMI'S INTENT GUARDIAN\]\s*(DO NOT STOP[^\n]*\n)?/, "").trim();
-    const gap = (clean.match(/(?:^|\n)Gap:\s*([\s\S]*?)(?=\n(?:Execute now|Next action)|\nVerify|$)/i) || [])[1];
-    const exec = (clean.match(/(?:^|\n)(?:Execute now[^\n]*?\):|Next action:)\s*([\s\S]*?)(?=\nVerify[^\n]*:|$)/i) || [])[1];
-    const verify = (clean.match(/(?:^|\n)Verify[^\n]*:\s*([\s\S]*)$/i) || [])[1];
+    const clean = msg.replace(/^\[SAMI'S INTENT GUARDIAN\]\s*(?:DO NOT STOP[^\n]*\n)?/i, "").trim();
+    const gap = (clean.match(/(?:^|\n)Gap:\s*([\s\S]*?)(?=\n(?:Execute now|Next action|Before finishing)|\nVerify|$)/i) || [])[1];
+    const exec = (clean.match(/(?:^|\n)(?:Execute now[^\n]*?:|Next action:)\s*([\s\S]*?)(?=\n(?:Verify[^\n]*:|Before finishing[^\n]*:)|$)/i) || [])[1];
+    const verify = (clean.match(/(?:^|\n)(?:Verify[^\n]*:|Before finishing[^\n]*:)\s*([\s\S]*)$/i) || [])[1];
     if (gap || exec || verify) return { gap, exec, verify };
     return null;
   }
 
-  function eventCardHtml(ev, idx, deliveredSet) {
-    const kindLbl = {
-      correction: "Guardian Prompt",
-      delivered: "Delivered to Session",
-      outcome: "Outcome",
-      error: "Observer Error",
-      manual_followup: "Manual Follow-Up Prompt",
-    }[ev.kind] || ev.kind;
-    let stPill = ev.outcome ? `<span class="badge-pill ${ev.outcome === "verified" ? "st-completed" : ev.outcome === "pending" ? "st-pending" : "st-stopped"}">${esc(ev.outcome)}</span>` : "";
-    let body = "";
-    if (ev.kind === "correction" && ev.message) {
-      if (deliveredSet.has(ev.message)) {
-        stPill += '<span class="badge-pill st-completed">✓ Delivered</span>';
+  function buildTimeline(rawEvents, showAllMessages) {
+    const sorted = [...(rawEvents || [])].sort((a, b) => (a.at || 0) - (b.at || 0));
+    const deliveredMsgs = new Set();
+    const outcomeByMsg = new Map();
+    for (const ev of sorted) {
+      if (ev.kind === "delivered" && ev.message) deliveredMsgs.add(ev.message);
+      if (ev.kind === "outcome" && ev.message && ev.outcome) {
+        outcomeByMsg.set(ev.message, { status: ev.outcome, at: ev.at });
       }
-      const parts = parseCorrectionParts(ev.message);
-      if (parts) {
-        body = `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div>`;
-      } else {
-        body = `<div class="ev-body">${esc(ev.message)}</div>`;
-      }
-    } else if (ev.kind === "manual_followup" && ev.message) {
-      const m = ev.message.match(/^\[([a-z0-9_]+)\]\s*([\s\S]*)$/i);
-      const cat = m ? m[1] : "steering";
-      const snippet = m ? m[2] : ev.message;
-      stPill = `<span class="badge-pill st-manual">${esc(CATEGORY_LABELS[cat] || cat)}</span>`;
-      body = `<div class="ev-body">${esc(snippet)}</div>`;
-    } else if (ev.message && ["error", "delivered"].includes(ev.kind)) {
-      body = `<div class="ev-body">${esc(ev.message)}</div>`;
     }
-    const copyBtn = ev.kind === "correction" && ev.message ? `<div class="ev-foot"><button class="mini-btn" data-copy-ev="${idx}">Copy Prompt</button></div>` : "";
-    return `<div class="ev-card k-${esc(ev.kind)}"><div class="ev-head"><strong>${esc(kindLbl)}</strong>${stPill}<time>${esc(fullTime(ev.at))}</time></div>${body}${copyBtn}</div>`;
+    const items = [];
+    let promptNum = 0;
+    const manualList = sorted.filter((e) => e.kind === "manual_followup");
+    for (const ev of sorted) {
+      if (ev.kind === "delivered" || ev.kind === "outcome") continue;
+      if (!showAllMessages && (ev.kind === "turn_user" || ev.kind === "turn_assistant")) continue;
+      if (ev.kind === "correction") {
+        promptNum += 1;
+        const finOutcome = outcomeByMsg.get(ev.message)?.status || ev.outcome || "pending";
+        items.push({
+          ...ev,
+          _promptNum: promptNum,
+          _delivered: ev.message ? deliveredMsgs.has(ev.message) : false,
+          _outcome: finOutcome,
+        });
+        continue;
+      }
+      if (ev.kind === "turn_user") {
+        // Avoid duplicating a turn_user right next to the matching manual_followup snippet
+        const msgNorm = (ev.message || "").slice(0, 60);
+        const dupManual = manualList.some((m) => Math.abs((m.at || 0) - (ev.at || 0)) < 8 && (m.message || "").includes(msgNorm.slice(0, 25)));
+        if (dupManual) continue;
+      }
+      items.push(ev);
+    }
+    return items;
+  }
+
+  function timelineItemHtml(ev, idx) {
+    if (ev.kind === "turn_user") {
+      return `<div class="chat-row me"><div class="bubble me"><div class="b-head"><strong>You</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div></div>`;
+    }
+    if (ev.kind === "manual_followup") {
+      const m = (ev.message || "").match(/^\[([a-z0-9_]+)\]\s*([\s\S]*)$/i);
+      const cat = m ? m[1] : "steering";
+      const snippet = m ? m[2] : (ev.message || "");
+      return `<div class="chat-row me"><div class="bubble me manual"><div class="b-head"><strong>You (Post-Guardian)</strong><span class="badge-pill st-manual">${esc(CATEGORY_LABELS[cat] || cat)}</span><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(snippet)}</div></div></div>`;
+    }
+    if (ev.kind === "turn_assistant") {
+      return `<div class="chat-row agent"><div class="bubble agent"><div class="b-head"><strong>Agent</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div></div>`;
+    }
+    if (ev.kind === "correction") {
+      const stCls = ev._outcome === "verified" ? "st-completed" : ev._outcome === "pending" ? "st-pending" : "st-stopped";
+      const delivPill = ev._delivered ? '<span class="badge-pill st-completed">✓ Delivered</span>' : "";
+      const outPill = `<span class="badge-pill ${stCls}">${esc(ev._outcome)}</span>`;
+      const parts = ev.message ? parseCorrectionParts(ev.message) : null;
+      const body = parts
+        ? `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div>`
+        : `<div class="ev-body">${esc(ev.message)}</div>`;
+      const copyBtn = ev.message ? `<div class="ev-foot"><button class="mini-btn" data-copy-ev="${idx}">Copy Prompt</button></div>` : "";
+      return `<div class="ev-card k-correction"><div class="ev-head"><strong>Guardian Prompt #${ev._promptNum}</strong>${delivPill}${outPill}<time>${esc(fullTime(ev.at))}</time></div>${body}${copyBtn}</div>`;
+    }
+    if (ev.kind === "error") {
+      return `<div class="ev-card k-error"><div class="ev-head"><strong>Observer Error</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div>`;
+    }
+    return "";
   }
 
   function detailHtml(s, inSheet) {
     const hm = HOST_META[s.host] || { label: s.host, code: s.host.slice(0, 2).toUpperCase(), color: "#8E8E93" };
+    const title = s.title || s.project || hm.label;
     const cmd = resumeCommand(s.host, s.session_id, s.session_url);
     const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Completed", "st-completed"], pending: ["Needs Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
     const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
-    const deliveredSet = new Set(s.events.filter((e) => e.kind === "delivered" && e.message).map((e) => e.message));
+    const cached = sessionCache.get(s.key);
+    const rawEvents = (chatMode === "all" && cached?.events?.length) ? cached.events : s.events;
+    const timeline = buildTimeline(rawEvents, chatMode === "all");
+    const hasTurns = timeline.some((x) => x.kind === "turn_user" || x.kind === "turn_assistant");
+    const showAllBanner = chatMode === "all" && !hasTurns
+      ? `<div class="hint-banner">${cached?.loading ? "Loading full conversation messages…" : "Only Guardian & follow-up messages are stored for this older session (new & backfilled sessions include full User/Agent turns)."}</div>`
+      : "";
+
     return `<div class="d-top">
-        <div class="tt">${esc(s.project || hm.label)} · ${esc(s.session_id.slice(0, 8))}</div>
+        <div class="tt">${esc(title)}</div>
         <div class="navs">
+          <div class="seg" role="group" aria-label="Message visibility">
+            <button class="seg-b${chatMode === "prompts" ? " on" : ""}" data-mode="prompts">Sent Prompts</button>
+            <button class="seg-b${chatMode === "all" ? " on" : ""}" data-mode="all">All Messages</button>
+          </div>
           ${inSheet ? '<button class="glass close-btn" data-act="close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ""}
           <button class="glass" data-act="prev" ${selIdx <= 0 ? "disabled" : ""} aria-label="Previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
-          <span class="pos">${selIdx + 1} / ${filtered.length}</span>
+          <span class="pos">${selIdx + 1}/${filtered.length}</span>
           <button class="glass" data-act="next" ${selIdx >= filtered.length - 1 ? "disabled" : ""} aria-label="Next"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>
         </div>
       </div>
       <div class="d-scroll">
         <div class="hero-card">
           <div class="hero-row">
-            <div class="av" style="width:48px;height:48px;font-size:16px;background:${hm.color}20;color:${hm.color}">${esc(hm.code)}</div>
+            <div class="av" style="width:44px;height:44px;font-size:15px;background:${hm.color}20;color:${hm.color}">${esc(hm.code)}</div>
             <div class="hero-meta">
-              <h2>${esc(s.project || hm.label)}</h2>
+              <h2>${esc(title)}</h2>
               <div class="hero-tags">
                 <span class="tag">${esc(hm.label)}</span>
+                ${s.project ? `<span class="tag">${esc(s.project)}</span>` : ""}
                 <span class="badge-pill ${stCls}">${esc(stLbl)}</span>
                 ${s.deliveredCount ? `<span class="badge-pill st-completed">✓ Delivered ×${s.deliveredCount}</span>` : ""}
                 ${s.manualCount ? `<span class="badge-pill st-manual">Manual Follow-Up ×${s.manualCount}</span>` : ""}
@@ -633,12 +730,28 @@ function clientApp() {
           </div>
           <div class="acts">
             ${s.session_url ? `<a class="act primary" href="${esc(s.session_url)}" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14L21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Open Session</a>` : ""}
-            <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy Resume" : "Copy Resume Command"}</button>
+            <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy URL" : "Copy Resume Command"}</button>
           </div>
         </div>
-        <div class="ev-sec">Activity &amp; Guardian Prompts · ${s.events.length}</div>
-        <div class="cards">${s.events.length ? s.events.map((e, i) => eventCardHtml(e, i, deliveredSet)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions or errors required yet.</div></div>'}</div>
+        <div class="ev-sec">${chatMode === "all" ? "Conversation Chronology (Oldest → Newest)" : "Guardian Prompts & Follow-Ups (Oldest → Newest)"} · ${timeline.length}</div>
+        ${showAllBanner}
+        <div class="cards">${timeline.length ? timeline.map((e, i) => timelineItemHtml(e, i)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions required.</div></div>'}</div>
       </div>`;
+  }
+
+  async function fetchSessionDetail(s, scrollBottom = false) {
+    if (!s) return;
+    const prev = sessionCache.get(s.key);
+    if (prev && prev.last_at === s.last_at && prev.events) return;
+    sessionCache.set(s.key, { ...(prev || {}), loading: true });
+    try {
+      const res = await fetch(`/api/session?host=${encodeURIComponent(s.host)}&session_id=${encodeURIComponent(s.session_id)}`, { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        sessionCache.set(s.key, { last_at: s.last_at, loading: false, events: data.events || [] });
+        if (selKey === s.key && viewMode === "session") renderDetail(scrollBottom);
+      }
+    } catch {}
   }
 
   function overviewHtml(inSheet) {
@@ -698,7 +811,7 @@ function clientApp() {
               <span class="badge-pill ${w.alive ? "st-completed" : "st-pending"}">${w.alive ? `Watcher v${esc(w.version || "?")} Live (${esc(ageLabel(w.age_sec))})` : "Watcher Heartbeat Pending"}</span>
               ${w.pid ? `<span class="tag">PID ${esc(w.pid)}</span>` : ""}
               <span class="tag">${esc(w.ticks ?? 0)} ticks · ${esc(w.ai_calls ?? 0)} AI calls · ${esc(w.deliveries ?? 0)} auto-delivered</span>
-              ${w.active_writer_skips ? `<span class="tag">${esc(w.active_writer_skips)} active-writer retries</span>` : ""}
+              ${w.cdp_fails ? `<span class="badge-pill st-pending">CDP fails: ${esc(w.cdp_fails)}</span>` : ""}
             </div>
           </div>
         </div>
@@ -707,7 +820,7 @@ function clientApp() {
       <div class="plat-grid">${platRows}</div>
       <div class="ev-sec">Where User Still Had to Manually Prompt (${m.manual_followups ?? 0})</div>
       <div class="hero-card"><div class="hero-tags">${catPills}</div></div>
-      <div class="cards" style="margin-top:10px">${recentManual || '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Zero post-Guardian manual follow-ups captured on v1.8+ yet — new human turns after a Guardian intervention will classify and stream here automatically.</div></div>'}</div>
+      <div class="cards" style="margin-top:10px">${recentManual || '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Zero post-Guardian manual follow-ups captured yet.</div></div>'}</div>
     </div>`;
   }
 
@@ -725,16 +838,21 @@ function clientApp() {
     }
   }
 
-  function renderDetail(scrollTop) {
+  function renderDetail(scrollToBottom) {
     const s = filtered[selIdx];
     if (!s) return;
     viewMode = "session";
     $("overviewBtn").classList.remove("on");
     const wide = isWide();
     const root = wide ? $("main") : $("sheetDetail");
-    const prevScroll = !scrollTop && root.querySelector(".d-scroll") ? root.querySelector(".d-scroll").scrollTop : 0;
+    const oldScroll = root.querySelector(".d-scroll");
+    const prevScroll = !scrollToBottom && oldScroll ? oldScroll.scrollTop : null;
     root.innerHTML = detailHtml(s, !wide);
-    if (!scrollTop && root.querySelector(".d-scroll")) root.querySelector(".d-scroll").scrollTop = prevScroll;
+    const sc = root.querySelector(".d-scroll");
+    if (sc) {
+      if (scrollToBottom) sc.scrollTop = sc.scrollHeight;
+      else if (prevScroll !== null) sc.scrollTop = prevScroll;
+    }
     document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
   }
 
@@ -743,9 +861,11 @@ function clientApp() {
     selIdx = i;
     selKey = filtered[i].key;
     renderDetail(true);
+    if (chatMode === "all") fetchSessionDetail(filtered[i], true);
     if (!isWide()) { $("bd").classList.add("on"); $("sheet").classList.add("on"); document.body.style.overflow = "hidden"; }
   }
   function openKey(key) {
+    fScope = "all";
     fHost = "all";
     fState = "all";
     fProject = "all";
@@ -768,6 +888,14 @@ function clientApp() {
 
   function bindRoot(root) {
     root.addEventListener("click", (e) => {
+      const modeBtn = e.target.closest("[data-mode]");
+      if (modeBtn) {
+        chatMode = modeBtn.dataset.mode;
+        const s = filtered[selIdx];
+        renderDetail(true);
+        if (chatMode === "all" && s) fetchSessionDetail(s, true);
+        return;
+      }
       const act = e.target.closest("[data-act]");
       if (act) {
         if (act.dataset.act === "close") closeSheet();
@@ -776,6 +904,7 @@ function clientApp() {
       }
       const jHost = e.target.closest("[data-jump-host]");
       if (jHost) {
+        fScope = "all";
         fHost = jHost.dataset.jumpHost;
         fState = "all";
         fProject = "all";
@@ -798,7 +927,10 @@ function clientApp() {
       const evBtn = e.target.closest("[data-copy-ev]");
       if (evBtn) {
         const s = filtered[selIdx];
-        const msg = s?.events?.[+evBtn.dataset.copyEv]?.message || "";
+        const cached = s ? sessionCache.get(s.key) : null;
+        const rawEvents = (chatMode === "all" && cached?.events?.length) ? cached.events : (s?.events || []);
+        const timeline = buildTimeline(rawEvents, chatMode === "all");
+        const msg = timeline[+evBtn.dataset.copyEv]?.message || "";
         if (msg) navigator.clipboard?.writeText(msg).then(() => toast("Copied Guardian prompt"), () => toast("Copy unavailable"));
       }
     });
@@ -807,10 +939,18 @@ function clientApp() {
   bindRoot($("sheetDetail"));
 
   $("overviewBtn").onclick = () => renderOverview(true);
+  $("scopeTabs").onclick = (e) => {
+    const b = e.target.closest("[data-scope]");
+    if (!b) return;
+    fScope = b.dataset.scope;
+    selKey = null;
+    renderList();
+  };
   $("kpiGrid").onclick = (e) => {
     const btn = e.target.closest("[data-kpi]");
     if (!btn) return;
     const target = btn.dataset.kpi;
+    fScope = "prompted";
     fState = fState === target ? "all" : target;
     viewMode = "session";
     selKey = null;
@@ -922,7 +1062,12 @@ svg{display:block}
 .kv{font-family:var(--round);font-size:20px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
 .kl{font-size:11.5px;font-weight:600;margin-top:2px}
 .ks{font-size:11px;color:var(--label-2);margin-top:1px}
-.search{margin:10px 16px 0;display:flex;align-items:center;gap:7px;background:var(--fill);border-radius:10px;height:36px;padding:0 10px;color:var(--label-2)}
+.seg{display:inline-flex;background:var(--fill);padding:2px;border-radius:9px;gap:2px}
+.seg.full{display:flex;margin:10px 16px 0}
+.seg.full .seg-b{flex:1;text-align:center;justify-content:center}
+.seg-b{height:26px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:600;color:var(--label-2);display:inline-flex;align-items:center;white-space:nowrap;transition:background .15s,color .15s}
+.seg-b.on{background:var(--card);color:var(--label);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.search{margin:9px 16px 0;display:flex;align-items:center;gap:7px;background:var(--fill);border-radius:10px;height:36px;padding:0 10px;color:var(--label-2)}
 .search svg{width:16px;height:16px;flex:none}
 .search input{flex:1;border:0;background:none;font:inherit;font-size:15px;color:var(--label);outline:none;min-width:0}
 .search input::placeholder{color:var(--label-2)}
@@ -962,34 +1107,42 @@ svg{display:block}
 .st-stopped{background:var(--fill);color:var(--label-2)}
 .empty{text-align:center;color:var(--label-2);padding:48px 20px;font-size:14px}
 .detail{height:100%;display:flex;flex-direction:column;background:var(--bg);position:relative}
-.d-top{height:52px;padding:0 14px;display:flex;align-items:center;justify-content:space-between;background:var(--bar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--sep);flex:none}
-.d-top .tt{font-weight:600;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;margin-right:10px}
-.navs{display:flex;gap:8px;align-items:center;flex:none}
-.glass{width:30px;height:30px;border-radius:50%;background:var(--fill);color:var(--accent);display:grid;place-items:center}
-.glass svg{width:14px;height:14px}
+.d-top{min-height:52px;padding:6px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;background:var(--bar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--sep);flex:none}
+.d-top .tt{font-weight:600;font-size:15.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:140px}
+.navs{display:flex;gap:6px;align-items:center;flex:none;flex-wrap:wrap}
+.glass{width:28px;height:28px;border-radius:50%;background:var(--fill);color:var(--accent);display:grid;place-items:center}
+.glass svg{width:13px;height:13px}
 .glass:disabled{opacity:.32;pointer-events:none}
-.pos{font-size:12px;color:var(--label-2);font-variant-numeric:tabular-nums;min-width:34px;text-align:center}
+.pos{font-size:12px;color:var(--label-2);font-variant-numeric:tabular-nums;min-width:30px;text-align:center}
 .main .close-btn{display:none}
 .d-scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:16px 18px calc(28px + var(--sb))}
-.hero-card{background:var(--card);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.hero-card{background:var(--card);border-radius:14px;padding:15px;display:flex;flex-direction:column;gap:11px}
 .hero-row{display:flex;align-items:flex-start;gap:12px}
 .hero-meta{flex:1;min-width:0}
-.hero-meta h2{font-family:var(--round);font-size:21px;font-weight:700;letter-spacing:-.3px;word-break:break-word}
+.hero-meta h2{font-family:var(--round);font-size:20px;font-weight:700;letter-spacing:-.3px;word-break:break-word}
 .hero-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .tag{font-size:12px;font-weight:500;padding:3px 9px;border-radius:8px;background:var(--fill);color:var(--label-2)}
-.sid{font-family:var(--mono);font-size:12px;color:var(--label-2);word-break:break-all;margin-top:2px}
+.sid{font-family:var(--mono);font-size:11.5px;color:var(--label-2);word-break:break-all;margin-top:2px}
 .acts{display:flex;flex-wrap:wrap;gap:8px}
-.act{flex:1;min-width:130px;height:38px;border-radius:10px;background:var(--accent-soft);color:var(--accent);font-size:13.5px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;padding:0 12px;transition:transform .1s}
+.act{flex:1;min-width:130px;height:36px;border-radius:10px;background:var(--accent-soft);color:var(--accent);font-size:13px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;padding:0 12px;transition:transform .1s}
 .act:active{transform:scale(.97)}
 .act.primary{background:var(--accent);color:#fff}
-.act svg{width:16px;height:16px;flex:none}
-.ev-sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:18px 4px 8px}
+.act svg{width:15px;height:15px;flex:none}
+.ev-sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:16px 4px 8px}
+.hint-banner{background:var(--fill);color:var(--label-2);font-size:12.5px;padding:9px 12px;border-radius:10px;margin-bottom:10px}
 .cards{display:flex;flex-direction:column;gap:10px}
+.chat-row{display:flex;width:100%}
+.chat-row.me{justify-content:flex-end}
+.chat-row.agent{justify-content:flex-start}
+.bubble{max-width:86%;background:var(--card);border-radius:14px;padding:11px 13px;display:flex;flex-direction:column;gap:5px;box-shadow:0 .5px 1px rgba(0,0,0,.05)}
+.bubble.me{background:var(--accent-soft);border-bottom-right-radius:4px}
+.bubble.me.manual{background:var(--pink-soft)}
+.bubble.agent{border-bottom-left-radius:4px}
+.b-head{display:flex;align-items:center;gap:7px;font-size:12px;flex-wrap:wrap}
+.b-head time{margin-left:auto;color:var(--label-2);font-size:11px;font-variant-numeric:tabular-nums}
 .ev-card{background:var(--card);border-radius:12px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;border-left:3px solid transparent;text-align:left;width:100%}
 .ev-card.k-correction{border-left-color:var(--accent)}
 .ev-card.k-error{border-left-color:var(--red)}
-.ev-card.k-delivered{border-left-color:var(--green)}
-.ev-card.k-outcome{border-left-color:var(--purple)}
 .ev-card.k-manual_followup{border-left-color:var(--pink)}
 .ov-row:active{transform:scale(.99)}
 .ev-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -1038,9 +1191,10 @@ svg{display:block}
       <div class="watcher-pill" id="watcherBar"><i></i><span>Watcher · loading…</span></div>
     </div>
     <div class="kpi-grid" id="kpiGrid"></div>
+    <div class="seg full" id="scopeTabs"></div>
     <label class="search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4.2-4.2"/></svg>
-      <input id="searchInput" type="search" placeholder="Search session, project, prompt…" autocomplete="off">
+      <input id="searchInput" type="search" placeholder="Search title, session, project, prompt…" autocomplete="off">
     </label>
     <div class="chips" id="hostChips"></div>
     <div class="chips" id="stateChips"></div>
@@ -1048,7 +1202,7 @@ svg{display:block}
     <div id="list"></div>
   </aside>
   <main class="main" id="main">
-    <div class="placeholder"><div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l7 4v5c0 5-3.5 8-7 9-3.5-1-7-4-7-9V7l7-4z"/></svg>Select a session to inspect prompts &amp; live state</div></div>
+    <div class="placeholder"><div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l7 4v5c0 5-3.5 8-7 9-3.5-1-7-4-7-9V7l7-4z"/></svg>Select a session to inspect prompts &amp; conversation</div></div>
   </main>
 </div>
 <div class="bd" id="bd"></div>
@@ -1069,7 +1223,8 @@ function serve(database, feedToken, readerPassword) {
   const feedAuthorization = "Bearer " + feedToken;
   const readerAuthorization = "Basic " + Buffer.from("sami:" + readerPassword).toString("base64");
   async function handle(request) {
-    const route = new URL(request.url, "http://localhost").pathname;
+    const parsedUrl = new URL(request.url, "http://localhost");
+    const route = parsedUrl.pathname;
     if (route === "/healthz" && request.method === "GET") {
       database.prepare("SELECT id FROM events LIMIT 1").get();
       return response("OK");
@@ -1081,6 +1236,17 @@ function serve(database, feedToken, readerPassword) {
         return response("Unauthorized", 401, { "WWW-Authenticate": 'Basic realm="Intent Guardian", charset="UTF-8"' });
       }
       return response(JSON.stringify(queryState(database)), 200, { "Content-Type": "application/json; charset=utf-8" });
+    }
+    if (route === "/api/session" && request.method === "GET") {
+      if (!matches(request.headers.authorization, readerAuthorization)) {
+        return response("Unauthorized", 401, { "WWW-Authenticate": 'Basic realm="Intent Guardian", charset="UTF-8"' });
+      }
+      const host = parsedUrl.searchParams.get("host") || "";
+      const sid = parsedUrl.searchParams.get("session_id") || "";
+      if (!hosts.includes(host) || !/^[\w:.-]{1,180}$/.test(sid)) {
+        return response("Invalid host or session_id", 400);
+      }
+      return response(JSON.stringify(querySession(database, host, sid)), 200, { "Content-Type": "application/json; charset=utf-8" });
     }
     if (route !== "/") return response("Not found", 404);
     if (request.method !== "GET") return response("Method not allowed", 405, { Allow: "GET" });
@@ -1112,7 +1278,7 @@ function serve(database, feedToken, readerPassword) {
 const database = new DatabaseSync(process.env.GUARDIAN_DB_PATH ?? "/data/guardian.sqlite");
 database.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
 database.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
-for (const col of ["project TEXT", "session_url TEXT", "session_state TEXT"]) {
+for (const col of ["project TEXT", "session_url TEXT", "session_state TEXT", "title TEXT"]) {
   try { database.exec("ALTER TABLE events ADD COLUMN " + col); } catch {}
 }
 if (process.argv[2] === "--import-events") {

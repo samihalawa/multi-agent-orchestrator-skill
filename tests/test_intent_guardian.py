@@ -1097,6 +1097,50 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(g.classify_manual_followup("priorizando lo que está más cerca del dinero y no solo cosas de hoy"), "prior_insistence")
         self.assertEqual(g.classify_manual_followup("how is it going?"), "live_verification")
 
+    def test_v20_feed_events_opt_in_chat_turns_and_title_without_raw_tools(self):
+        state_dir = self.root / "state"
+        _, st = g.process_event({
+            "session_id": "v20-chat-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Fix dashboard timeline sorting secret_token_xyz",
+            "cwd": "/tmp/work/ig-ui",
+        }, "codex", self.cfg, state_dir)
+        g.process_event({
+            "session_id": "v20-chat-1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "read_file",
+            "tool_response": "RAW_TOOL_INTERNAL_DUMP",
+        }, "codex", self.cfg, state_dir)
+        _, st = g.process_event({
+            "session_id": "v20-chat-1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Sorted messages oldest to newest.",
+        }, "codex", self.cfg, state_dir, self.reviewer)
+
+        # Default privacy mode omits chat turns & prompt title
+        default_evts = g.feed_events(st)
+        self.assertNotIn("RAW_TOOL_INTERNAL_DUMP", json.dumps(default_evts))
+        self.assertFalse(any(e["kind"] in ("turn_user", "turn_assistant") for e in default_evts))
+
+        # Opt-in mode includes title & redacted turns, never raw tool dumps
+        full_evts = g.feed_events(st, include_messages=True)
+        self.assertIn("Fix dashboard timeline sorting", full_evts[0].get("title", ""))
+        self.assertTrue(any(e["kind"] == "turn_user" for e in full_evts))
+        self.assertTrue(any(e["kind"] == "turn_assistant" for e in full_evts))
+        self.assertNotIn("RAW_TOOL_INTERNAL_DUMP", json.dumps(full_evts))
+
+    def test_v20_passive_user_handoff_detected_as_question_stop(self):
+        self.assertTrue(g.is_question_stop({"last_assistant_message": "Cleanup plan left for Sami to delete old repos."}, {"evidence": []}))
+        self.assertTrue(g.is_question_stop({"last_assistant_message": "Items are ready to delete once you confirm."}, {"evidence": []}))
+
+    def test_v20_empty_session_start_has_no_intent_for_ghost_filtering(self):
+        out, st = g.process_event({
+            "conversationId": "ghost-agy-1",
+            "hookEventName": "SessionStart",
+        }, "antigravity", self.cfg, self.root / "state")
+        self.assertIn("injectSteps", out)
+        self.assertEqual(st["intent"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
