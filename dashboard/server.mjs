@@ -1559,7 +1559,7 @@ html[data-theme="dark"]{
   ::-webkit-scrollbar-track{background:var(--sb-track)}
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-html{font-family:var(--font);background:var(--bg);color:var(--text);font-size:15px;-webkit-font-smoothing:antialiased;container-type:scroll-state;scroll-padding-top:56px}
+html{font-family:var(--font);background:var(--bg);color:var(--text);font-size:15px;-webkit-font-smoothing:antialiased;container-type:scroll-state;scroll-padding-top:56px;overflow-x:clip}
 body{min-height:100dvh;background:var(--bg);overflow-x:clip}
 button,input,select{font:inherit;color:inherit}
 button{background:none;border:0;cursor:pointer}
@@ -1625,6 +1625,7 @@ a{color:inherit}
 .search-box input::placeholder{color:var(--text-3)}
 .clear-x{font-size:15px;color:var(--text-3);padding:0 4px;line-height:1}
 .toolbar-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+@media (max-width:420px){.seg-b{padding:0 7px;font-size:12px}.filter-btn{padding:0 8px;font-size:12px}}
 .filter-btn{height:29px;padding:0 10px;border-radius:7px;border:1px solid var(--border);background:var(--bg);font-size:12.5px;font-weight:500;color:var(--text-2);display:inline-flex;align-items:center;gap:6px}
 .filter-btn:hover{background:var(--hover);color:var(--text)}
 .filter-btn.active{border-color:var(--accent);color:var(--accent)}
