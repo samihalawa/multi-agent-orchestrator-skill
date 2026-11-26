@@ -402,14 +402,14 @@ function querySession(database, host, sessionId) {
 
 function clientApp() {
   const HOST_META = {
-    codex: { label: "Codex", code: "CX", color: "#007AFF" },
-    claude: { label: "Claude Code", code: "CC", color: "#FF9F0A" },
-    antigravity: { label: "Antigravity", code: "AG", color: "#34C759" },
-    chatgpt: { label: "ChatGPT", code: "CG", color: "#30B0C7" },
-    claude_ai: { label: "Claude.ai", code: "CA", color: "#FF9F0A" },
-    gemini_web: { label: "Gemini", code: "GM", color: "#5856D6" },
-    grokbot: { label: "Grok", code: "GK", color: "#AF52DE" },
-    cowork: { label: "Cowork", code: "CW", color: "#FF2D55" },
+    codex: { label: "Codex", color: "#2563EB" },
+    claude: { label: "Claude Code", color: "#D97706" },
+    antigravity: { label: "Antigravity", color: "#16A34A" },
+    chatgpt: { label: "ChatGPT", color: "#0D9488" },
+    claude_ai: { label: "Claude.ai", color: "#D97706" },
+    gemini_web: { label: "Gemini", color: "#4F46E5" },
+    grokbot: { label: "Grok", color: "#9333EA" },
+    cowork: { label: "Cowork", color: "#DB2777" },
   };
   const HOST_ORDER = ["codex", "claude", "antigravity", "chatgpt", "claude_ai", "gemini_web", "grokbot", "cowork"];
   const CATEGORY_LABELS = {
@@ -422,28 +422,75 @@ function clientApp() {
     route_override: "Route Override",
     steering: "Steering",
   };
+
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
-  const isWide = () => innerWidth >= 760;
+  const isWide = () => innerWidth >= 900;
 
   let state = { serverTime: Date.now() / 1000, watcher: null, metrics: null, sessions: [], events: [] };
-  let sessions = [], filtered = [];
-  let fScope = "all", fHost = "all", fState = "all", fProject = "all";
-  let selKey = null, selIdx = -1, viewMode = "session", chatMode = "prompts";
+  let sessions = [];
+  let filtered = [];
+  let fScope = "all";
+  let fHost = "all";
+  let fState = "all";
+  let fProject = "all";
+  let selKey = null;
+  let selIdx = -1;
+  let viewMode = "sessions"; // "sessions" | "health"
+  let mobileView = "list";   // "list" | "detail" | "health"
+  let pinnedChatMode = null; // null (auto) | "all" | "prompts"
+  let expandAllCards = false;
+  let listScrollY = 0;
+
+  let userScrolling = false;
+  let scrollIdleTimer = null;
+  let pendingSyncData = null;
+  let lastListSig = "";
+  let lastDetailSig = "";
+  let lastHealthSig = "";
+  let bottomObserver = null;
+
   const sessionCache = new Map();
   const expandedCards = new Set();
   const collapsedCards = new Set();
-  let expandAllCards = false;
-  let themeMode = "auto";
-  try { themeMode = localStorage.getItem("ig_theme") || "auto"; } catch {}
 
-  const applyTheme = () => {
+  // --- Theme (dark-mode & dark-mode-toggle guides) ---
+  function getStoredTheme() {
+    try {
+      const v = localStorage.getItem("color-scheme");
+      return v === "light" || v === "dark" ? v : "system";
+    } catch {
+      return "system";
+    }
+  }
+  function applyTheme(mode) {
+    const meta = document.querySelector('meta[name="color-scheme"]');
     const root = document.documentElement;
-    if (themeMode === "dark" || themeMode === "light") root.dataset.theme = themeMode;
-    else delete root.dataset.theme;
-    const btn = $("themeBtn");
-    if (btn) btn.textContent = themeMode === "dark" ? "Dark" : themeMode === "light" ? "Light" : "Auto";
-  };
+    if (mode === "light" || mode === "dark") {
+      if (meta) meta.content = mode;
+      root.dataset.theme = mode;
+    } else {
+      if (meta) meta.content = "light dark";
+      delete root.dataset.theme;
+    }
+    document.querySelectorAll("[data-theme-opt]").forEach((btn) => {
+      const active = btn.dataset.themeOpt === mode;
+      btn.classList.toggle("on", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+  }
+  function setTheme(mode) {
+    try {
+      if (mode === "light" || mode === "dark") localStorage.setItem("color-scheme", mode);
+      else localStorage.removeItem("color-scheme");
+    } catch {}
+    applyTheme(mode);
+  }
+  window.addEventListener("storage", (e) => {
+    if (e.key === "color-scheme") applyTheme(getStoredTheme());
+  });
+
+  // --- Formatting helpers ---
   const fmtDuration = (sec) => {
     if (sec == null || !Number.isFinite(sec)) return "—";
     if (sec < 60) return `${Math.round(sec)}s`;
@@ -454,11 +501,13 @@ function clientApp() {
     }
     return `${Math.round(sec / 360) / 10}h`;
   };
-
   const relTime = (ts) => {
     if (!ts) return "";
-    const d = new Date(ts * 1000), n = new Date();
-    if (d.toDateString() === n.toDateString()) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const d = new Date(ts * 1000);
+    const n = new Date();
+    if (d.toDateString() === n.toDateString()) {
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
     return d.toLocaleDateString([], { day: "numeric", month: "short" });
   };
   const ageLabel = (sec) => {
@@ -467,7 +516,19 @@ function clientApp() {
     if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
     return `${Math.round(sec / 3600)}h ago`;
   };
-  const fullTime = (ts) => ts ? new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Madrid", dateStyle: "medium", timeStyle: "short" }) : "";
+  const fullTime = (ts) => (ts
+    ? new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Madrid", dateStyle: "medium", timeStyle: "short" })
+    : "");
+  const dateBucket = (ts, nowSec) => {
+    if (!ts) return "Earlier";
+    const d = new Date(ts * 1000);
+    const n = new Date(nowSec * 1000);
+    if (d.toDateString() === n.toDateString()) return "Today";
+    const y = new Date(n);
+    y.setDate(n.getDate() - 1);
+    if (d.toDateString() === y.toDateString()) return "Yesterday";
+    return "Earlier";
+  };
 
   function resumeCommand(host, sid, url) {
     if (host === "codex") return "codex resume " + sid;
@@ -506,7 +567,17 @@ function clientApp() {
     for (const ev of state.events || []) {
       const key = ev.host + ":" + ev.session_id;
       if (!byKey.has(key)) {
-        byKey.set(key, { key, host: ev.host, session_id: ev.session_id, last_at: ev.at, project: ev.project, title: ev.title, session_url: ev.session_url, session_state: ev.session_state, events: [] });
+        byKey.set(key, {
+          key,
+          host: ev.host,
+          session_id: ev.session_id,
+          last_at: ev.at,
+          project: ev.project,
+          title: ev.title,
+          session_url: ev.session_url,
+          session_state: ev.session_state,
+          events: [],
+        });
       }
       const obj = byKey.get(key);
       obj.events.push(ev);
@@ -530,144 +601,203 @@ function clientApp() {
     }).sort((a, b) => (b.last_at || 0) - (a.last_at || 0));
   }
 
-  function renderHeaderTelemetry() {
-    const w = state.watcher;
-    const wb = $("watcherBar");
-    if (!w) {
-      wb.className = "watcher-pill offline";
-      wb.innerHTML = '<i></i><span>Watcher · awaiting heartbeat</span>';
-    } else {
-      const live = Boolean(w.alive);
-      wb.className = `watcher-pill ${live ? "on" : "stale"}`;
-      wb.innerHTML = `<i></i><span>Watcher v${esc(w.version || "?")} · ${live ? "Live" : "Stale"} ${esc(ageLabel(w.age_sec))} · ${w.auto_deliver ? "Auto-Deliver ON" : "Observe"} · ${esc(w.ticks ?? 0)} ticks · ${esc(w.deliveries ?? 0)} deliv</span>`;
-    }
-
-    const m = state.metrics || {};
-    $("kpiGrid").innerHTML = `
-      <div class="kpi"><div class="kv">${m.corrections ?? 0}</div><div class="kl">Guardian Prompts</div><div class="ks">${m.delivered ?? 0} delivered · ${m.pending ?? 0} open</div></div>
-      <div class="kpi"><div class="kv">${m.verified ?? 0}</div><div class="kl">Verified Closed</div><div class="ks">${m.superseded ?? 0} superseded</div></div>
-      <button class="kpi kpi-btn${fState === "manual" ? " on" : ""}" data-kpi="manual"><div class="kv">${m.manual_followups ?? 0}</div><div class="kl">Manual Follow-Ups</div><div class="ks">after Guardian</div></button>
-      <button class="kpi kpi-btn${fState === "error" ? " on" : ""}" data-kpi="error"><div class="kv">${m.errors ?? 0}</div><div class="kl">Observer Errors</div><div class="ks">${m.last_24h?.errors ?? 0} in 24h</div></button>
-    `;
-    const pCnt = sessions.filter((s) => s.isPrompted).length;
-    $("scopeTabs").innerHTML = `
-      <button class="seg-b${fScope === "all" ? " on" : ""}" data-scope="all">All Monitored · ${sessions.length}</button>
-      <button class="seg-b${fScope === "prompted" ? " on" : ""}" data-scope="prompted">Prompted · ${pCnt}</button>
-    `;
-    $("overviewBtn").classList.toggle("on", viewMode === "overview");
+  function effectiveChatMode(s) {
+    if (pinnedChatMode) return pinnedChatMode;
+    if (!s) return "all";
+    return (s.corrections > 0 || s.errorCount > 0) ? "prompts" : "all";
   }
 
-  function renderChips() {
-    const scoped = fScope === "prompted" ? sessions.filter((s) => s.isPrompted) : sessions;
+  function syncLayoutMode() {
+    const wide = isWide();
+    const shell = $("shell");
+    shell.dataset.wide = wide ? "1" : "0";
+    shell.dataset.view = wide ? viewMode : mobileView;
+    const isSessionsTab = viewMode === "sessions";
+    $("tabSessions").classList.toggle("on", isSessionsTab);
+    $("tabHealth").classList.toggle("on", !isSessionsTab);
+    $("tabSessions").setAttribute("aria-selected", isSessionsTab ? "true" : "false");
+    $("tabHealth").setAttribute("aria-selected", !isSessionsTab ? "true" : "false");
+  }
+
+  function renderHeaderWatcher() {
+    const w = state.watcher;
+    const dot = $("watcherDot");
+    const lbl = $("watcherTitle");
+    if (!w) {
+      dot.className = "w-dot offline";
+      lbl.title = "Watcher: awaiting heartbeat";
+    } else {
+      const live = Boolean(w.alive);
+      dot.className = `w-dot ${live ? "on" : "stale"}`;
+      lbl.title = `Watcher v${w.version || "?"} · ${live ? "Live" : "Stale"} (${ageLabel(w.age_sec)}) · ${w.auto_deliver ? "Auto-Deliver ON" : "Observe"} · ${w.ticks ?? 0} ticks`;
+    }
+  }
+
+  function renderFilterPopover() {
+    const scoped = sessions.filter((s) => {
+      if (fScope === "prompted") return s.isPrompted;
+      if (fScope === "action") return s.status === "pending" || s.status === "error";
+      return true;
+    });
+
     const activeHosts = HOST_ORDER.filter((h) => scoped.some((s) => s.host === h));
     if (fHost !== "all" && !activeHosts.includes(fHost)) fHost = "all";
-    const hostItems = [["all", "All", null, scoped.length], ...activeHosts.map((h) => [h, HOST_META[h]?.label || h, HOST_META[h]?.color || "#8E8E93", scoped.filter((s) => s.host === h).length])];
-    $("hostChips").innerHTML = hostItems.map(([k, lbl, col, cnt]) =>
-      `<button class="chip${fHost === k ? " on" : ""}" data-host="${esc(k)}">${col ? `<span class="d" style="background:${col}"></span>` : ""}${esc(lbl)} <span class="n">${cnt}</span></button>`
-    ).join("");
+    const hostSel = $("filterHost");
+    const hostOpts = [["all", `All platforms (${scoped.length})`], ...activeHosts.map((h) => {
+      const cnt = scoped.filter((s) => s.host === h).length;
+      return [h, `${HOST_META[h]?.label || h} (${cnt})`];
+    })];
+    hostSel.innerHTML = hostOpts.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("");
+    hostSel.value = fHost;
 
     const baseH = scoped.filter((s) => fHost === "all" || s.host === fHost);
-    const stCounts = {
-      all: baseH.length,
-      pending: baseH.filter((s) => s.status === "pending").length,
-      manual: baseH.filter((s) => s.manualCount > 0).length,
-      ongoing: baseH.filter((s) => s.status === "ongoing").length,
-      completed: baseH.filter((s) => s.status === "completed").length,
-      error: baseH.filter((s) => s.status === "error").length,
-    };
-    const stItems = [
-      ["all", "Any State", null],
-      ["pending", "Needs Action", "#FF9F0A"],
-      ["manual", "Manual Prompt", "#FF2D55"],
-      ["ongoing", "Ongoing", "#007AFF"],
-      ["completed", "Completed", "#34C759"],
-      ["error", "Errors", "#FF3B30"],
-    ].filter(([k]) => k === "all" || stCounts[k] > 0);
-    $("stateChips").innerHTML = stItems.map(([k, lbl, col]) =>
-      `<button class="chip${fState === k ? " on" : ""}" data-st="${k}">${col ? `<span class="d" style="background:${col}"></span>` : ""}${esc(lbl)} <span class="n">${stCounts[k]}</span></button>`
-    ).join("");
+    const stDefs = [
+      ["all", `Any status (${baseH.length})`],
+      ["pending", `Needs action (${baseH.filter((s) => s.status === "pending").length})`],
+      ["ongoing", `Ongoing (${baseH.filter((s) => s.status === "ongoing").length})`],
+      ["manual", `Manual follow-up (${baseH.filter((s) => s.manualCount > 0).length})`],
+      ["completed", `Completed (${baseH.filter((s) => s.status === "completed").length})`],
+      ["error", `Errors (${baseH.filter((s) => s.status === "error").length})`],
+    ];
+    const stateSel = $("filterState");
+    stateSel.innerHTML = stDefs.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("");
+    stateSel.value = fState;
 
-    const projs = [...new Set(baseH.map((s) => s.project).filter(Boolean))];
-    if (fProject !== "all" && !projs.includes(fProject)) fProject = "all";
-    $("projectChips").style.display = projs.length ? "flex" : "none";
-    if (projs.length) {
-      $("projectChips").innerHTML = [["all", "All Projects", baseH.length], ...projs.map((p) => [p, p, baseH.filter((s) => s.project === p).length])].map(([k, lbl, cnt]) =>
-        `<button class="chip${fProject === k ? " on" : ""}" data-proj="${esc(k)}">${esc(lbl)} <span class="n">${cnt}</span></button>`
-      ).join("");
+    const projCounts = new Map();
+    for (const s of baseH) {
+      if (s.project) projCounts.set(s.project, (projCounts.get(s.project) || 0) + 1);
+    }
+    const projs = [...projCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    if (fProject !== "all" && !projCounts.has(fProject)) fProject = "all";
+    const projSel = $("filterProject");
+    projSel.innerHTML = [
+      `<option value="all">All projects (${baseH.length})</option>`,
+      ...projs.map(([p, c]) => `<option value="${esc(p)}">${esc(p)} (${c})</option>`),
+    ].join("");
+    projSel.value = fProject;
+
+    const activeCount = (fHost !== "all" ? 1 : 0) + (fState !== "all" ? 1 : 0) + (fProject !== "all" ? 1 : 0);
+    const badge = $("filterBadge");
+    badge.textContent = activeCount ? String(activeCount) : "";
+    badge.hidden = activeCount === 0;
+    $("filterBtn").classList.toggle("active", activeCount > 0);
+
+    const chips = [];
+    if (fHost !== "all") chips.push(`<button type="button" class="active-chip" data-clear="host">${esc(HOST_META[fHost]?.label || fHost)} <span aria-hidden="true">×</span></button>`);
+    if (fState !== "all") chips.push(`<button type="button" class="active-chip" data-clear="state">${esc(fState)} <span aria-hidden="true">×</span></button>`);
+    if (fProject !== "all") chips.push(`<button type="button" class="active-chip" data-clear="project">${esc(fProject)} <span aria-hidden="true">×</span></button>`);
+    const bar = $("activeFilters");
+    if (chips.length) {
+      bar.innerHTML = chips.join("") + '<button type="button" class="clear-all" data-clear="all">Clear</button>';
+      bar.hidden = false;
+    } else {
+      bar.innerHTML = "";
+      bar.hidden = true;
     }
   }
 
   function rowHtml(s, i) {
-    const hm = HOST_META[s.host] || { label: s.host, code: s.host.slice(0, 2).toUpperCase(), color: "#8E8E93" };
+    const hm = HOST_META[s.host] || { label: s.host, color: "#64748B" };
     const mainTitle = s.title || s.project || hm.label;
-    const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Done", "st-completed"], pending: ["Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
-    const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
+    const dotCls = s.status === "ongoing" ? "dot-live"
+      : s.status === "pending" ? "dot-warn"
+      : s.status === "error" ? "dot-err"
+      : "dot-idle";
+
+    const metaParts = [esc(hm.label)];
+    if (s.project && s.project !== mainTitle) metaParts.push(esc(s.project));
+    if (s.status === "pending") metaParts.push('<span class="sig-warn">Needs action</span>');
+    else if (s.status === "error") metaParts.push('<span class="sig-err">Error</span>');
+    if (s.corrections > 0) metaParts.push(`<span>${s.corrections} prompt${s.corrections === 1 ? "" : "s"}</span>`);
+    if (s.manualCount > 0) metaParts.push(`<span class="sig-manual">${s.manualCount} manual</span>`);
+
     const clean = cleanPreview(s.latestMsg);
-    const sub = clean || (s.turnCount ? `${s.turnCount} chat turns · clean` : "Monitored cleanly · no prompts needed");
-    const delivBadge = s.deliveredCount ? `<span class="badge-pill st-completed">✓${s.deliveredCount}</span>` : "";
-    const manBadge = s.manualCount ? `<span class="badge-pill st-manual">Manual×${s.manualCount}</span>` : "";
-    const projTag = s.project && s.project !== mainTitle ? `<span>· ${esc(s.project.slice(0, 22))}</span>` : "";
-    return `<button class="row${viewMode === "session" && s.key === selKey && isWide() ? " sel" : ""}" data-i="${i}">
-      <div class="av" style="background:${hm.color}20;color:${hm.color}">${esc(hm.code)}<span class="dot" style="background:${s.status === "ongoing" ? "var(--green)" : s.status === "pending" ? "var(--orange)" : s.status === "error" ? "var(--red)" : "transparent"}"></span></div>
-      <div class="rt">
-        <div class="rt-top"><div class="rn">${esc(mainTitle)}</div><span class="rt2">${esc(relTime(s.last_at))}</span></div>
-        <div class="rsub"><span>${esc(hm.label)}</span>${projTag}<span class="badge-pill ${stCls}">${esc(stLbl)}</span>${delivBadge}${manBadge}${s.corrections ? `<span>· ${s.corrections}p</span>` : ""}</div>
-        <div class="rs">${esc(sub)}</div>
+    const preview = clean || (s.turnCount ? `${s.turnCount} turn${s.turnCount === 1 ? "" : "s"} · clean` : "Monitored · no interventions");
+    const isSelected = viewMode === "sessions" && s.key === selKey && isWide();
+
+    return `<button type="button" class="row${isSelected ? " sel" : ""}" data-i="${i}">
+      <div class="row-top">
+        <span class="s-dot ${dotCls}" aria-hidden="true"></span>
+        <span class="row-title">${esc(mainTitle)}</span>
+        <time class="row-time">${esc(relTime(s.last_at))}</time>
       </div>
-      <svg class="chev" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l6 6-6 6"/></svg>
+      <div class="row-meta">${metaParts.join('<span class="sep-dot">·</span>')}</div>
+      <div class="row-prev">${esc(preview)}</div>
     </button>`;
   }
 
-  function renderList() {
+  function computeListSignature(items, q) {
+    const parts = [fScope, fHost, fState, fProject, q, selKey || "", isWide() ? "W" : "N", viewMode];
+    for (const s of items) {
+      parts.push(`${s.key}|${Math.floor(s.last_at || 0)}|${s.status}|${s.title || ""}|${s.project || ""}|${s.corrections}|${s.deliveredCount}|${s.manualCount}|${s.errorCount}|${s.turnCount}|${(s.latestMsg || "").slice(0, 48)}`);
+    }
+    return parts.join(";");
+  }
+
+  function renderList(force = false) {
     buildSessions();
-    renderHeaderTelemetry();
-    renderChips();
+    renderHeaderWatcher();
+    renderFilterPopover();
+
     const q = $("searchInput").value.trim().toLowerCase();
-    filtered = sessions.filter((s) =>
-      (fScope === "all" || s.isPrompted) &&
-      (fHost === "all" || s.host === fHost) &&
-      (fState === "all" || (fState === "manual" ? s.manualCount > 0 : s.status === fState)) &&
-      (fProject === "all" || s.project === fProject) &&
-      (!q || [s.session_id, s.host, HOST_META[s.host]?.label, s.project, s.title, s.latestMsg].join(" ").toLowerCase().includes(q))
-    );
-    const ongoingN = sessions.filter((s) => s.status === "ongoing").length;
-    const pendingN = sessions.filter((s) => s.status === "pending").length;
-    const sb = $("statusBar");
-    sb.className = "status live";
-    sb.lastElementChild.textContent = `Live · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${sessions.length} sessions · ${ongoingN} ongoing${pendingN ? " · " + pendingN + " action" : ""}`;
+    $("clearSearch").hidden = !q;
 
-    const activeNow = state.serverTime || Date.now() / 1000;
-    const needsActive = filtered.filter((s) => (s.status === "pending" || s.status === "error") && (activeNow - (s.last_at || 0)) < 21600);
-    const active = filtered.filter((s) => s.status === "ongoing");
-    const needsOlder = filtered.filter((s) => (s.status === "pending" || s.status === "error") && (activeNow - (s.last_at || 0)) >= 21600);
-    const rest = filtered.filter((s) => !needsActive.includes(s) && !active.includes(s) && !needsOlder.includes(s));
-    const groups = [
-      ["Needs Action (Active)", needsActive],
-      ["Ongoing", active],
-      ["Older Open (>6h)", needsOlder],
-      ["Completed & Recent", rest],
-    ].filter(([, arr]) => arr.length);
-    filtered = groups.flatMap(([, arr]) => arr);
-    let idx = 0;
-    $("list").innerHTML = filtered.length
-      ? groups.map(([name, arr]) => `<div class="sec">${esc(name)} · ${arr.length}</div><div class="group">${arr.map((s) => rowHtml(s, idx++)).join("")}</div>`).join("")
-      : '<div class="empty">No matching sessions. Try switching to "All Monitored".</div>';
+    const scopedAll = sessions.filter((s) => {
+      if (fScope === "prompted" && !s.isPrompted) return false;
+      if (fScope === "action" && s.status !== "pending" && s.status !== "error") return false;
+      if (fHost !== "all" && s.host !== fHost) return false;
+      if (fState !== "all" && (fState === "manual" ? s.manualCount === 0 : s.status !== fState)) return false;
+      if (fProject !== "all" && s.project !== fProject) return false;
+      if (q && ![s.session_id, s.host, HOST_META[s.host]?.label, s.project, s.title, s.latestMsg].join(" ").toLowerCase().includes(q)) return false;
+      return true;
+    });
 
-    if (arguments[0] === true) {
-      document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
+    const pCnt = sessions.filter((s) => s.isPrompted).length;
+    const aCnt = sessions.filter((s) => s.status === "pending" || s.status === "error").length;
+    $("scopeTabs").innerHTML = `
+      <button type="button" class="seg-b${fScope === "all" ? " on" : ""}" data-scope="all">All <span>${sessions.length}</span></button>
+      <button type="button" class="seg-b${fScope === "prompted" ? " on" : ""}" data-scope="prompted">Prompted <span>${pCnt}</span></button>
+      <button type="button" class="seg-b${fScope === "action" ? " on" : ""}" data-scope="action">Action <span>${aCnt}</span></button>
+    `;
+
+    filtered = scopedAll;
+    const sig = computeListSignature(filtered, q);
+    if (force || sig !== lastListSig) {
+      lastListSig = sig;
+      const now = state.serverTime || Date.now() / 1000;
+      const buckets = new Map([["Today", []], ["Yesterday", []], ["Earlier", []]]);
+      for (const s of filtered) {
+        buckets.get(dateBucket(s.last_at, now)).push(s);
+      }
+      let idx = 0;
+      const html = [...buckets.entries()]
+        .filter(([, arr]) => arr.length > 0)
+        .map(([label, arr]) => `<div class="sec">${esc(label)} · ${arr.length}</div><div class="group">${arr.map((s) => rowHtml(s, idx++)).join("")}</div>`)
+        .join("");
+      $("list").innerHTML = html || '<div class="empty">No matching sessions.</div>';
+    }
+
+    if (viewMode === "health") {
+      if (isWide() || mobileView === "health") renderHealth(force);
       return;
     }
-    if (viewMode === "overview" && isWide()) {
-      renderOverview(false);
-    } else if (selKey) {
+
+    if (selKey) {
       const k = filtered.findIndex((s) => s.key === selKey);
       if (k >= 0) {
         selIdx = k;
-        renderDetail(false);
-        fetchSessionDetail(filtered[k], false);
+        if (isWide() || mobileView === "detail") {
+          renderDetail(false, force);
+          fetchSessionDetail(filtered[k], false);
+        }
+      } else if (isWide() && filtered.length) {
+        openAt(0, false);
       }
     } else if (isWide() && filtered.length) {
-      openAt(0);
+      openAt(0, false);
+    } else if (isWide() && !filtered.length) {
+      lastDetailSig = "";
+      $("main").innerHTML = '<div class="placeholder">Select a session to inspect prompts &amp; activity</div>';
     }
   }
 
@@ -715,7 +845,6 @@ function clientApp() {
         continue;
       }
       if (ev.kind === "turn_user") {
-        // Avoid duplicating a turn_user right next to the matching manual_followup snippet
         const msgNorm = (ev.message || "").slice(0, 60);
         const dupManual = manualList.some((m) => Math.abs((m.at || 0) - (ev.at || 0)) < 10 && (m.message || "").includes(msgNorm.slice(0, 25)));
         if (dupManual) continue;
@@ -725,107 +854,213 @@ function clientApp() {
     return items;
   }
 
+  function renderMessageBody(text) {
+    const raw = String(text || "");
+    if (raw.length <= 750) return `<div class="msg-body">${esc(raw)}</div>`;
+    const preview = raw.slice(0, 520).trimEnd() + "…";
+    return `<div class="msg-body">${esc(preview)}</div>
+      <details class="inline-more"><summary>Show full message (${raw.length} chars)</summary><div class="msg-body full">${esc(raw)}</div></details>`;
+  }
+
   function timelineItemHtml(ev, idx, sessionKey) {
     if (ev.kind === "turn_user") {
-      return `<div class="chat-row me"><div class="bubble me"><div class="b-head"><strong>You</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div></div>`;
+      return `<article class="msg msg-user">
+        <header class="msg-head"><strong>You</strong><time>${esc(fullTime(ev.at))}</time></header>
+        ${renderMessageBody(ev.message)}
+      </article>`;
     }
     if (ev.kind === "manual_followup") {
       const m = (ev.message || "").match(/^\[([a-z0-9_]+)\]\s*([\s\S]*)$/i);
       const cat = m ? m[1] : "steering";
       const snippet = m ? m[2] : (ev.message || "");
-      return `<div class="chat-row me"><div class="bubble me manual"><div class="b-head"><strong>You (Post-Guardian)</strong><span class="badge-pill st-manual">${esc(CATEGORY_LABELS[cat] || cat)}</span><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(snippet)}</div></div></div>`;
+      return `<article class="msg msg-manual">
+        <header class="msg-head"><strong>You · Follow-up</strong><span class="tag-inline">${esc(CATEGORY_LABELS[cat] || cat)}</span><time>${esc(fullTime(ev.at))}</time></header>
+        ${renderMessageBody(snippet)}
+      </article>`;
     }
     if (ev.kind === "turn_assistant") {
-      return `<div class="chat-row agent"><div class="bubble agent"><div class="b-head"><strong>Agent</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div></div>`;
+      return `<article class="msg msg-agent">
+        <header class="msg-head"><strong>Agent</strong><time>${esc(fullTime(ev.at))}</time></header>
+        ${renderMessageBody(ev.message)}
+      </article>`;
     }
     if (ev.kind === "correction") {
-      const stCls = ev._outcome === "verified" ? "st-completed" : ev._outcome === "pending" ? "st-pending" : "st-stopped";
-      const delivPill = ev._delivered ? '<span class="badge-pill st-completed">✓ Delivered</span>' : "";
-      const outPill = `<span class="badge-pill ${stCls}">${esc(ev._outcome)}</span>`;
-      const turnPill = ev._turnaroundSec != null ? `<span class="tag">resolved in ${esc(fmtDuration(ev._turnaroundSec))}</span>` : "";
+      const statusCls = ev._outcome === "verified" ? "ok" : ev._outcome === "pending" ? "warn" : "muted";
       const parts = ev.message ? parseCorrectionParts(ev.message) : null;
       const cardId = `${sessionKey}:${ev.id || idx}`;
       const defaultOpen = ev._outcome === "pending" || ev._promptNum === ev._totalPrompts;
       const isOpen = expandAllCards || (!collapsedCards.has(cardId) && (expandedCards.has(cardId) || defaultOpen));
-      let body;
+      let body = "";
       if (parts) {
         const hasMore = Boolean(parts.exec || parts.verify);
         const moreHtml = hasMore
-          ? `<details class="ev-more" data-card-id="${esc(cardId)}"${isOpen ? " open" : ""}><summary>Execution contract &amp; proof</summary><div class="ev-kv" style="margin-top:8px">${parts.exec ? `<div><b>Execute Contract</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Primary Proof</b>${esc(parts.verify.trim())}</div>` : ""}</div></details>`
+          ? `<details class="ev-more" data-card-id="${esc(cardId)}"${isOpen ? " open" : ""}><summary>Execution contract &amp; proof</summary><div class="ev-kv">${parts.exec ? `<div><b>Execute</b>${esc(parts.exec.trim())}</div>` : ""}${parts.verify ? `<div><b>Verify</b>${esc(parts.verify.trim())}</div>` : ""}</div></details>`
           : "";
-        body = `<div class="ev-kv">${parts.gap ? `<div><b>Gap</b>${esc(parts.gap.trim())}</div>` : ""}</div>${moreHtml}`;
+        body = `${parts.gap ? `<div class="ev-gap">${esc(parts.gap.trim())}</div>` : ""}${moreHtml}`;
       } else {
-        body = `<div class="ev-body">${esc(ev.message)}</div>`;
+        body = `<div class="ev-gap">${esc(ev.message)}</div>`;
       }
-      const copyBtn = ev.message ? `<div class="ev-foot"><button class="mini-btn" data-copy-ev="${idx}">Copy Prompt</button></div>` : "";
-      return `<div class="ev-card k-correction"><div class="ev-head"><strong>Guardian Prompt #${ev._promptNum}</strong>${delivPill}${outPill}${turnPill}<time>${esc(fullTime(ev.at))}</time></div>${body}${copyBtn}</div>`;
+      const metaBits = [
+        ev._delivered ? "Delivered" : null,
+        ev._outcome,
+        ev._turnaroundSec != null ? `resolved in ${fmtDuration(ev._turnaroundSec)}` : null,
+      ].filter(Boolean);
+
+      return `<article class="g-card">
+        <header class="g-head">
+          <strong>Guardian #${ev._promptNum}</strong>
+          <span class="g-status ${statusCls}">${esc(metaBits.join(" · "))}</span>
+          <time>${esc(fullTime(ev.at))}</time>
+          ${ev.message ? `<button type="button" class="text-btn" data-copy-ev="${idx}">Copy</button>` : ""}
+        </header>
+        ${body}
+      </article>`;
     }
     if (ev.kind === "error") {
-      return `<div class="ev-card k-error"><div class="ev-head"><strong>Observer Error</strong><time>${esc(fullTime(ev.at))}</time></div><div class="ev-body">${esc(ev.message)}</div></div>`;
+      return `<article class="g-card g-err">
+        <header class="g-head"><strong>Observer Error</strong><time>${esc(fullTime(ev.at))}</time></header>
+        <div class="ev-gap">${esc(ev.message)}</div>
+      </article>`;
     }
     return "";
   }
 
-  function detailHtml(s, inSheet) {
-    const hm = HOST_META[s.host] || { label: s.host, code: s.host.slice(0, 2).toUpperCase(), color: "#8E8E93" };
+  function detailHtml(s) {
+    const hm = HOST_META[s.host] || { label: s.host };
     const title = s.title || s.project || hm.label;
     const cmd = resumeCommand(s.host, s.session_id, s.session_url);
-    const stMap = { ongoing: ["Ongoing", "st-ongoing"], completed: ["Completed", "st-completed"], pending: ["Needs Action", "st-pending"], error: ["Error", "st-error"], stopped: ["Idle", "st-stopped"] };
-    const [stLbl, stCls] = stMap[s.status] || ["Observed", "st-stopped"];
+    const stLabels = { ongoing: "Ongoing", completed: "Completed", pending: "Needs action", error: "Error", stopped: "Idle" };
+    const stLbl = stLabels[s.status] || "Observed";
+
     const cached = sessionCache.get(s.key);
     const fullRaw = cached?.events?.length ? cached.events : s.events;
+    const mode = effectiveChatMode(s);
     const promptsTimeline = buildTimeline(fullRaw, false);
     const allTimeline = buildTimeline(fullRaw, true);
-    const timeline = chatMode === "all" ? allTimeline : promptsTimeline;
+    const timeline = mode === "all" ? allTimeline : promptsTimeline;
     const hasTurns = allTimeline.some((x) => x.kind === "turn_user" || x.kind === "turn_assistant");
-    const showAllBanner = chatMode === "all" && !hasTurns
-      ? `<div class="hint-banner">${cached?.loading ? "Loading full conversation messages…" : "Only Guardian & follow-up messages are stored for this older session (recent & backfilled sessions include full User/Agent turns)."}</div>`
-      : "";
     const promptTotal = promptsTimeline.filter((x) => x.kind === "correction").length;
-    const expandBtn = promptTotal > 1
-      ? `<button class="mini-btn" data-toggle-expand="1">${expandAllCards ? "Collapse All" : "Expand All"}</button>`
-      : "";
 
-    return `<div class="d-top">
-        <div class="tt">${esc(title)}</div>
-        <div class="navs">
-          <div class="seg" role="group" aria-label="Message visibility">
-            <button class="seg-b${chatMode === "prompts" ? " on" : ""}" data-mode="prompts">Sent Prompts · ${promptsTimeline.length}</button>
-            <button class="seg-b${chatMode === "all" ? " on" : ""}" data-mode="all">All Messages${cached?.events ? ` · ${allTimeline.length}` : ""}</button>
-          </div>
-          ${inSheet ? '<button class="glass close-btn" data-act="close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ""}
-          <button class="glass" data-act="prev" ${selIdx <= 0 ? "disabled" : ""} aria-label="Previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>
-          <span class="pos">${selIdx + 1}/${filtered.length}</span>
-          <button class="glass" data-act="next" ${selIdx >= filtered.length - 1 ? "disabled" : ""} aria-label="Next"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>
-        </div>
-      </div>
-      <div class="d-scroll">
-        <div class="hero-card">
-          <div class="hero-row">
-            <div class="av" style="width:44px;height:44px;font-size:15px;background:${hm.color}20;color:${hm.color}">${esc(hm.code)}</div>
-            <div class="hero-meta">
-              <h2>${esc(title)}</h2>
-              <div class="hero-tags">
-                <span class="tag">${esc(hm.label)}</span>
-                ${s.project ? `<span class="tag">${esc(s.project)}</span>` : ""}
-                <span class="badge-pill ${stCls}">${esc(stLbl)}</span>
-                ${s.deliveredCount ? `<span class="badge-pill st-completed">✓ Delivered ×${s.deliveredCount}</span>` : ""}
-                ${s.manualCount ? `<span class="badge-pill st-manual">Manual Follow-Up ×${s.manualCount}</span>` : ""}
-                <span class="tag">${esc(fullTime(s.last_at))}</span>
-              </div>
-              <div class="sid">${esc(s.session_id)}</div>
+    const metaItems = [hm.label, s.project, stLbl, fullTime(s.last_at)].filter(Boolean);
+
+    return `<div class="d-top-wrap">
+        <div class="d-top">
+          <div class="d-top-left">
+            <button type="button" class="back-btn" data-act="back" aria-label="Back to sessions">← Sessions</button>
+            <div class="d-titles">
+              <div class="d-tt">${esc(title)}</div>
+              <div class="d-sub">${esc(metaItems.join(" · "))}</div>
             </div>
           </div>
-          <div class="acts">
-            ${s.session_url ? `<a class="act primary" href="${esc(s.session_url)}" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14L21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>Open Session</a>` : ""}
-            <button class="act" data-copy-cmd="${esc(cmd)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>${s.session_url ? "Copy URL" : "Copy Resume Command"}</button>
+          <div class="d-acts">
+            ${s.session_url ? `<a class="ghost-btn" href="${esc(s.session_url)}" target="_blank" rel="noopener">Open ↗</a>` : ""}
+            <button type="button" class="ghost-btn" data-copy-cmd="${esc(cmd)}">${s.session_url ? "Copy URL" : "Copy cmd"}</button>
+            <div class="nav-pair">
+              <button type="button" class="icon-btn" data-act="prev" ${selIdx <= 0 ? "disabled" : ""} aria-label="Previous session">↑</button>
+              <button type="button" class="icon-btn" data-act="next" ${selIdx >= filtered.length - 1 ? "disabled" : ""} aria-label="Next session">↓</button>
+            </div>
           </div>
         </div>
-        <div class="ev-sec-row"><div class="ev-sec">${chatMode === "all" ? "Conversation Chronology (Oldest → Newest)" : "Guardian Prompts (Oldest → Newest)"} · ${timeline.length}</div>${expandBtn}</div>
-        ${showAllBanner}
-        <div class="cards">${timeline.length ? timeline.map((e, i) => timelineItemHtml(e, i, s.key)).join("") : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Monitored cleanly — no Guardian interventions required.</div></div>'}</div>
       </div>
-      <button class="jump-bot" data-jump-bot="1" hidden>↓ Latest</button>`;
+      <div class="d-body">
+        <div class="d-controls">
+          <div class="seg" role="group" aria-label="Timeline mode">
+            <button type="button" class="seg-b${mode === "all" ? " on" : ""}" data-mode="all">All activity${cached?.events ? ` <span>${allTimeline.length}</span>` : ""}</button>
+            <button type="button" class="seg-b${mode === "prompts" ? " on" : ""}" data-mode="prompts">Guardian only <span>${promptsTimeline.length}</span></button>
+          </div>
+          <div class="d-controls-r">
+            ${promptTotal > 1 ? `<button type="button" class="text-btn" data-toggle-expand="1">${expandAllCards ? "Collapse all" : "Expand all"}</button>` : ""}
+            <details class="info-pop">
+              <summary class="text-btn">Info</summary>
+              <div class="info-card">
+                <div><span>Session ID</span><code>${esc(s.session_id)}</code></div>
+                <div><span>Turns</span><span>${s.turnCount}</span></div>
+                <div><span>Prompts / Delivered</span><span>${s.corrections} / ${s.deliveredCount}</span></div>
+                <div><span>Manual follow-ups</span><span>${s.manualCount}</span></div>
+                <div><span>Last activity</span><span>${esc(fullTime(s.last_at))}</span></div>
+              </div>
+            </details>
+          </div>
+        </div>
+        ${mode === "all" && !hasTurns ? `<div class="hint-line">${cached?.loading ? "Loading conversation messages…" : "Only Guardian & follow-up events are stored for this session."}</div>` : ""}
+        <div class="thread">
+          ${timeline.length ? timeline.map((e, i) => timelineItemHtml(e, i, s.key)).join("") : '<div class="empty-thread">Monitored cleanly — no Guardian interventions required.</div>'}
+        </div>
+        <div class="scroll-sentinel" aria-hidden="true"></div>
+      </div>
+      <button type="button" class="jump-bot" data-jump-bot="1">↓ Latest</button>`;
+  }
+
+  function setupDetailScrollObserver() {
+    if (bottomObserver) {
+      bottomObserver.disconnect();
+      bottomObserver = null;
+    }
+    const main = $("main");
+    const sentinel = main.querySelector(".scroll-sentinel");
+    const jb = main.querySelector("[data-jump-bot]");
+    if (!sentinel || !jb) return;
+
+    if (!CSS.supports("container-type", "scroll-state")) {
+      const root = isWide() ? main : null;
+      bottomObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const atBottom = entry.isIntersecting;
+          main.classList.toggle("at-bottom", atBottom);
+          if (atBottom && document.activeElement === jb) {
+            main.focus({ preventScroll: true });
+          }
+        }
+      }, { root, threshold: 0 });
+      bottomObserver.observe(sentinel);
+    } else {
+      jb.addEventListener("focusout", () => {
+        if (!document.activeElement || document.activeElement === document.body) {
+          main.focus({ preventScroll: true });
+        }
+      });
+    }
+  }
+
+  function renderDetail(scrollToBottom = false, force = false) {
+    const s = filtered[selIdx];
+    if (!s) return;
+    const cached = sessionCache.get(s.key);
+    const fullRaw = cached?.events?.length ? cached.events : s.events;
+    const lastEv = fullRaw[fullRaw.length - 1] || {};
+    const mode = effectiveChatMode(s);
+    const sig = `${s.key}|${mode}|${expandAllCards}|${fullRaw.length}|${lastEv.id || ""}|${lastEv.at || ""}|${lastEv.outcome || ""}|${Boolean(cached?.loading)}|${selIdx}|${filtered.length}`;
+    if (!force && sig === lastDetailSig) return;
+
+    const main = $("main");
+    const prevKey = lastDetailSig.split("|")[0];
+    const isSameSession = prevKey === s.key;
+    const wide = isWide();
+    const nearBottom = wide
+      ? (main.scrollHeight - main.scrollTop - main.clientHeight) < 100
+      : (document.documentElement.scrollHeight - window.scrollY - window.innerHeight) < 100;
+    const prevScroll = wide ? main.scrollTop : window.scrollY;
+
+    lastDetailSig = sig;
+    main.innerHTML = detailHtml(s);
+    setupDetailScrollObserver();
+
+    if (scrollToBottom) {
+      if (wide) {
+        if (main.scrollHeight > main.clientHeight + 120) main.scrollTop = main.scrollHeight;
+        else main.scrollTop = 0;
+      } else {
+        window.scrollTo(0, 0);
+      }
+    } else if (isSameSession) {
+      if (nearBottom && wide) {
+        main.scrollTop = main.scrollHeight;
+      } else if (wide) {
+        main.scrollTop = prevScroll;
+      }
+    }
+
+    document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
   }
 
   async function fetchSessionDetail(s, scrollBottom = false) {
@@ -838,38 +1073,17 @@ function clientApp() {
       if (res.ok) {
         const data = await res.json();
         sessionCache.set(s.key, { last_at: s.last_at, loading: false, events: data.events || [] });
-        if (selKey === s.key && viewMode === "session") renderDetail(scrollBottom);
+        if (selKey === s.key && viewMode === "sessions") {
+          renderDetail(scrollBottom, true);
+        }
       }
     } catch {}
   }
 
-  function overviewHtml(inSheet) {
+  function healthHtml() {
     const w = state.watcher || {};
     const m = state.metrics || {};
     const perHost = m.per_host || {};
-    const platRows = HOST_ORDER.map((h) => {
-      const hm = HOST_META[h] || { label: h, code: h.slice(0, 2).toUpperCase(), color: "#8E8E93" };
-      const st = perHost[h] || {};
-      const wp = w.per_platform?.[h === "codex" ? "codex_broken_cwd" : h];
-      const last = st.last_at ? relTime(st.last_at) : "—";
-      const wpNote = wp ? (wp.error ? `Err: ${wp.error}` : (wp.last_checked ? "Watched" : "")) : "";
-      return `<button class="plat-card" data-jump-host="${esc(h)}">
-        <div class="plat-head">
-          <div class="av" style="width:32px;height:32px;font-size:12px;border-radius:9px;background:${hm.color}20;color:${hm.color}">${esc(hm.code)}</div>
-          <div class="plat-name"><strong>${esc(hm.label)}</strong><span>${esc(last)}${wpNote ? " · " + esc(wpNote) : ""}</span></div>
-          <span class="plat-sess">${st.sessions || 0}</span>
-        </div>
-        <div class="plat-stats">
-          <span>${st.prompts || st.corrections || 0} prompts</span>
-          <span>${st.delivered || 0} deliv</span>
-          <span>${st.verified || 0} ok</span>
-          ${st.redirected ? `<span>${st.redirected} redir</span>` : ""}
-          <span>${st.manual_followups || 0} manual</span>
-          ${st.errors ? `<span style="color:var(--red)">${st.errors} err</span>` : ""}
-        </div>
-      </button>`;
-    }).join("");
-
     const corrs = Number(m.corrections || 0);
     const deliv = Number(m.delivered || 0);
     const ver = Number(m.verified || 0);
@@ -877,262 +1091,401 @@ function clientApp() {
     const delivRate = corrs ? `${Math.round((deliv / corrs) * 100)}%` : "—";
     const verRate = closed ? `${Math.round((ver / closed) * 100)}%` : "—";
     const m24 = m.last_24h || {};
-    const watchEvents = Array.isArray(w.recent_events) ? w.recent_events : [];
-    const watchFeedHtml = watchEvents.length
-      ? watchEvents.slice(0, 12).map((ev) => `<div class="ev-card"><div class="ev-head"><span class="badge-pill st-ongoing">${esc(ev.kind || "info")}</span><strong>${esc(ev.detail || "")}</strong><time>${esc(ev.at ? fullTime(Date.parse(ev.at) / 1000) : "")}</time></div></div>`).join("")
-      : '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Waiting for next watcher action event…</div></div>';
+    const theme = getStoredTheme();
+
+    const platRows = HOST_ORDER.map((h) => {
+      const hm = HOST_META[h] || { label: h };
+      const st = perHost[h] || {};
+      const last = st.last_at ? relTime(st.last_at) : "—";
+      return `<tr class="plat-row" data-jump-host="${esc(h)}">
+        <td><strong>${esc(hm.label)}</strong></td>
+        <td class="num">${st.sessions || 0}</td>
+        <td class="num">${st.corrections || 0}</td>
+        <td class="num">${st.delivered || 0}</td>
+        <td class="num">${st.verified || 0}</td>
+        <td class="num">${st.manual_followups || 0}</td>
+        <td class="num">${st.errors || 0}</td>
+        <td class="muted">${esc(last)}</td>
+      </tr>`;
+    }).join("");
 
     const cats = Object.entries(m.manual_by_category || {}).sort((a, b) => b[1] - a[1]);
-    const catPills = cats.length
-      ? cats.map(([k, v]) => `<span class="tag">${esc(CATEGORY_LABELS[k] || k)}: <b>${v}</b></span>`).join("")
-      : '<span class="tag">No post-Guardian manual follow-ups logged yet</span>';
-    const recentManual = (m.recent_manual || []).map((r) => {
-      const hm = HOST_META[r.host] || { label: r.host, color: "#8E8E93" };
-      return `<button class="ev-card k-manual_followup ov-row" data-jump-key="${esc(r.host + ":" + r.session_id)}">
-        <div class="ev-head">
+    const catLine = cats.length
+      ? cats.map(([k, v]) => `${CATEGORY_LABELS[k] || k}: ${v}`).join(" · ")
+      : "None logged yet";
+
+    const recentManual = (m.recent_manual || []).slice(0, 15).map((r) => {
+      const hm = HOST_META[r.host] || { label: r.host };
+      return `<button type="button" class="manual-row" data-jump-key="${esc(r.host + ":" + r.session_id)}">
+        <div class="manual-top">
           <strong>${esc(r.project || hm.label)}</strong>
-          <span class="badge-pill st-manual">${esc(CATEGORY_LABELS[r.category] || r.category)}</span>
-          <span class="tag">${esc(hm.label)}</span>
-          <time>${esc(fullTime(r.at))}</time>
+          <span>${esc(hm.label)} · ${esc(CATEGORY_LABELS[r.category] || r.category)}</span>
+          <time>${esc(relTime(r.at))}</time>
         </div>
-        <div class="ev-body">${esc(r.snippet)}</div>
+        <div class="manual-msg">${esc(r.snippet)}</div>
       </button>`;
     }).join("");
 
-    return `<div class="d-top">
-      <div class="tt">System Overview · 7 Platforms + Watcher</div>
-      <div class="navs">${inSheet ? '<button class="glass close-btn" data-act="close" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' : ""}</div>
-    </div>
-    <div class="d-scroll">
-      <div class="hero-card">
-        <div class="hero-row">
-          <div class="av" style="width:44px;height:44px;font-size:15px;background:var(--accent-soft);color:var(--accent)">IG</div>
-          <div class="hero-meta">
-            <h2>Continuous Oversight Health</h2>
-            <div class="hero-tags">
-              <span class="badge-pill ${w.alive ? "st-completed" : "st-pending"}">${w.alive ? `Watcher v${esc(w.version || "?")} Live (${esc(ageLabel(w.age_sec))})` : "Watcher Heartbeat Pending"}</span>
-              ${w.pid ? `<span class="tag">PID ${esc(w.pid)}</span>` : ""}
-              <span class="tag">${esc(w.ticks ?? 0)} ticks · ${esc(w.ai_calls ?? 0)} AI calls · ${esc(w.deliveries ?? 0)} auto-delivered</span>
-              ${w.cdp_fails ? `<span class="badge-pill st-pending">CDP fails: ${esc(w.cdp_fails)}</span>` : ""}
+    const watchEvents = Array.isArray(w.recent_events) ? w.recent_events : [];
+    const watchHtml = watchEvents.length
+      ? watchEvents.slice(0, 12).map((ev) => `<div class="w-ev"><span>${esc(ev.kind || "info")}</span><span>${esc(ev.detail || "")}</span><time>${esc(ev.at ? relTime(Date.parse(ev.at) / 1000) : "")}</time></div>`).join("")
+      : '<div class="muted">Waiting for next watcher event…</div>';
+
+    return `<div class="d-top-wrap">
+        <div class="d-top">
+          <div class="d-top-left">
+            <button type="button" class="back-btn" data-act="back-health">← Sessions</button>
+            <div class="d-titles">
+              <div class="d-tt">System Health</div>
+              <div class="d-sub">${w.alive ? `Watcher v${esc(w.version || "?")} live (${esc(ageLabel(w.age_sec))})` : "Watcher heartbeat pending"} · ${esc(w.auto_deliver ? "Auto-deliver ON" : "Observe")} · ${esc(w.ticks ?? 0)} ticks</div>
             </div>
           </div>
         </div>
       </div>
-      <div class="ev-sec">Effectiveness Funnel</div>
-      <div class="funnel-grid">
-        <div class="kpi"><div class="kv">${esc(delivRate)}</div><div class="kl">Delivery Rate</div><div class="ks">${deliv}/${corrs} prompts</div></div>
-        <div class="kpi"><div class="kv">${esc(verRate)}</div><div class="kl">Verified Rate</div><div class="ks">${ver}/${closed} closed (${m.redirected ?? 0} redir)</div></div>
-        <div class="kpi"><div class="kv">${esc(fmtDuration(m.median_resolution_sec))}</div><div class="kl">Median Resolution</div><div class="ks">prompt → verified</div></div>
-        <div class="kpi"><div class="kv">${esc(m24.corrections ?? 0)}</div><div class="kl">Last 24h Prompts</div><div class="ks">${m24.verified ?? 0} ok · ${m24.manual_followups ?? 0} manual · ${m24.errors ?? 0} err</div></div>
-      </div>
-      <div class="ev-sec">Platform Coverage Matrix</div>
-      <div class="plat-grid">${platRows}</div>
-      <div class="ev-sec">Live Watcher Activity (${watchEvents.length})</div>
-      <div class="cards">${watchFeedHtml}</div>
-      <div class="ev-sec">Where User Still Had to Manually Prompt (${m.manual_followups ?? 0})</div>
-      <div class="hero-card"><div class="hero-tags">${catPills}</div></div>
-      <div class="cards" style="margin-top:10px">${recentManual || '<div class="ev-card"><div class="ev-body" style="color:var(--label-2)">Zero post-Guardian manual follow-ups captured yet.</div></div>'}</div>
-    </div>`;
+      <div class="d-body health-body">
+        <div class="metric-grid">
+          <div class="metric-cell"><div class="m-val">${corrs}</div><div class="m-lbl">Guardian Prompts</div><div class="m-sub">${delivRate} delivered (${deliv}) · ${m.pending ?? 0} open</div></div>
+          <div class="metric-cell"><div class="m-val">${ver}</div><div class="m-lbl">Verified Closed</div><div class="m-sub">${verRate} of ${closed} · median ${esc(fmtDuration(m.median_resolution_sec))}</div></div>
+          <button type="button" class="metric-cell metric-btn" data-kpi="manual"><div class="m-val">${m.manual_followups ?? 0}</div><div class="m-lbl">Manual Follow-Ups</div><div class="m-sub">${m24.manual_followups ?? 0} in last 24h → filter</div></button>
+          <button type="button" class="metric-cell metric-btn" data-kpi="error"><div class="m-val">${m.errors ?? 0}</div><div class="m-lbl">Observer Errors</div><div class="m-sub">${m24.errors ?? 0} in last 24h → filter</div></button>
+        </div>
+
+        <h2 class="h-sec">Platforms</h2>
+        <div class="table-wrap">
+          <table class="plat-table">
+            <thead><tr><th>Platform</th><th class="num">Sessions</th><th class="num">Prompts</th><th class="num">Deliv</th><th class="num">Verified</th><th class="num">Manual</th><th class="num">Errors</th><th>Last active</th></tr></thead>
+            <tbody>${platRows}</tbody>
+          </table>
+        </div>
+
+        <h2 class="h-sec">Recent Manual Follow-Ups</h2>
+        <p class="h-note">${esc(catLine)}</p>
+        <div class="manual-list">${recentManual || '<div class="muted">Zero post-Guardian manual follow-ups captured yet.</div>'}</div>
+
+        <details class="watcher-log">
+          <summary>Watcher activity log (${watchEvents.length})</summary>
+          <div class="w-ev-list">${watchHtml}</div>
+        </details>
+
+        <div class="health-foot">
+          <span class="m-lbl">Appearance</span>
+          <div class="seg" role="group" aria-label="Appearance">
+            <button type="button" class="seg-b${theme === "system" ? " on" : ""}" data-theme-opt="system">System</button>
+            <button type="button" class="seg-b${theme === "light" ? " on" : ""}" data-theme-opt="light">Light</button>
+            <button type="button" class="seg-b${theme === "dark" ? " on" : ""}" data-theme-opt="dark">Dark</button>
+          </div>
+        </div>
+      </div>`;
   }
 
-  function renderOverview(openSheetOnMobile = true) {
-    viewMode = "overview";
-    $("overviewBtn").classList.add("on");
-    document.querySelectorAll("#list .row").forEach((r) => r.classList.remove("sel"));
-    const wide = isWide();
-    const root = wide ? $("main") : $("sheetDetail");
-    root.innerHTML = overviewHtml(!wide);
-    if (!wide && openSheetOnMobile) {
-      $("bd").classList.add("on");
-      $("sheet").classList.add("on");
-      document.body.style.overflow = "hidden";
-    }
+  function renderHealth(force = false) {
+    const w = state.watcher || {};
+    const m = state.metrics || {};
+    const sig = `${w.ticks || 0}|${w.age_sec || 0}|${m.corrections || 0}|${m.verified || 0}|${m.manual_followups || 0}|${m.errors || 0}|${getStoredTheme()}`;
+    if (!force && sig === lastHealthSig) return;
+    lastHealthSig = sig;
+    $("main").innerHTML = healthHtml();
   }
 
-  function renderDetail(scrollToBottom) {
-    const s = filtered[selIdx];
-    if (!s) return;
-    viewMode = "session";
-    $("overviewBtn").classList.remove("on");
-    const wide = isWide();
-    const root = wide ? $("main") : $("sheetDetail");
-    const oldScroll = root.querySelector(".d-scroll");
-    const prevScroll = !scrollToBottom && oldScroll ? oldScroll.scrollTop : null;
-    root.innerHTML = detailHtml(s, !wide);
-    const sc = root.querySelector(".d-scroll");
-    const jb = root.querySelector("[data-jump-bot]");
-    const syncJumpBtn = () => {
-      if (!sc || !jb) return;
-      jb.hidden = (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 220;
-    };
-    if (sc) {
-      if (scrollToBottom) sc.scrollTop = sc.scrollHeight;
-      else if (prevScroll !== null) sc.scrollTop = prevScroll;
-      sc.addEventListener("scroll", syncJumpBtn, { passive: true });
-      syncJumpBtn();
-    }
-    document.querySelectorAll("#list .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === selIdx));
-  }
-
-  function openAt(i) {
+  function openAt(i, pushHistory = true) {
     if (i < 0 || i >= filtered.length) return;
+    const s = filtered[i];
+    if (!isWide() && mobileView === "list") {
+      listScrollY = window.scrollY;
+    }
     selIdx = i;
-    selKey = filtered[i].key;
-    renderDetail(true);
-    fetchSessionDetail(filtered[i], chatMode === "all");
-    if (!isWide()) { $("bd").classList.add("on"); $("sheet").classList.add("on"); document.body.style.overflow = "hidden"; }
+    selKey = s.key;
+    viewMode = "sessions";
+    if (!isWide()) {
+      mobileView = "detail";
+      if (pushHistory) {
+        try { history.pushState({ igView: "detail", key: s.key }, ""); } catch {}
+      }
+    }
+    syncLayoutMode();
+    renderDetail(true, true);
+    fetchSessionDetail(s, true);
   }
+
+  function backToList(fromPop = false) {
+    if (isWide()) return;
+    mobileView = "list";
+    viewMode = "sessions";
+    syncLayoutMode();
+    renderList(false);
+    requestAnimationFrame(() => window.scrollTo(0, listScrollY));
+    if (!fromPop && history.state?.igView) {
+      try { history.back(); } catch {}
+    }
+  }
+
   function openKey(key) {
     fScope = "all";
     fHost = "all";
     fState = "all";
     fProject = "all";
     $("searchInput").value = "";
-    viewMode = "session";
+    viewMode = "sessions";
     selKey = key;
-    renderList();
+    syncLayoutMode();
+    renderList(true);
     const idx = filtered.findIndex((s) => s.key === key);
-    if (idx >= 0) openAt(idx);
-  }
-  function closeSheet() {
-    $("sheet").classList.remove("on");
-    $("bd").classList.remove("on");
-    document.body.style.overflow = "";
-  }
-  function toast(t) {
-    const el = $("toast"); el.textContent = t; el.classList.add("on");
-    clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove("on"), 1700);
+    if (idx >= 0) openAt(idx, true);
   }
 
-  function bindRoot(root) {
-    root.addEventListener("toggle", (e) => {
-      const det = e.target;
-      if (!(det instanceof HTMLDetailsElement) || !det.dataset.cardId) return;
-      const id = det.dataset.cardId;
-      if (det.open) { expandedCards.add(id); collapsedCards.delete(id); }
-      else { expandedCards.delete(id); collapsedCards.add(id); }
-    }, true);
-    root.addEventListener("click", (e) => {
-      const expBtn = e.target.closest("[data-toggle-expand]");
-      if (expBtn) {
-        expandAllCards = !expandAllCards;
-        if (!expandAllCards) { expandedCards.clear(); collapsedCards.clear(); }
-        renderDetail(false);
-        return;
-      }
-      const jb = e.target.closest("[data-jump-bot]");
-      if (jb) {
-        const sc = root.querySelector(".d-scroll");
-        if (sc) sc.scrollTo({ top: sc.scrollHeight, behavior: "smooth" });
-        return;
-      }
-      const modeBtn = e.target.closest("[data-mode]");
-      if (modeBtn) {
-        chatMode = modeBtn.dataset.mode;
-        const s = filtered[selIdx];
-        renderDetail(true);
-        if (chatMode === "all" && s) fetchSessionDetail(s, true);
-        return;
-      }
-      const act = e.target.closest("[data-act]");
-      if (act) {
-        if (act.dataset.act === "close") closeSheet();
-        else openAt(selIdx + (act.dataset.act === "next" ? 1 : -1));
-        return;
-      }
-      const jHost = e.target.closest("[data-jump-host]");
-      if (jHost) {
-        fScope = "all";
-        fHost = jHost.dataset.jumpHost;
-        fState = "all";
-        fProject = "all";
-        viewMode = "session";
-        selKey = null;
-        if (!isWide()) closeSheet();
-        renderList();
-        return;
-      }
-      const jKey = e.target.closest("[data-jump-key]");
-      if (jKey) {
-        openKey(jKey.dataset.jumpKey);
-        return;
-      }
-      const cmdBtn = e.target.closest("[data-copy-cmd]");
-      if (cmdBtn) {
-        navigator.clipboard?.writeText(cmdBtn.dataset.copyCmd).then(() => toast("Copied resume command"), () => toast(cmdBtn.dataset.copyCmd));
-        return;
-      }
-      const evBtn = e.target.closest("[data-copy-ev]");
-      if (evBtn) {
-        const s = filtered[selIdx];
-        const cached = s ? sessionCache.get(s.key) : null;
-        const rawEvents = (cached?.events?.length) ? cached.events : (s?.events || []);
-        const timeline = buildTimeline(rawEvents, chatMode === "all");
-        const msg = timeline[+evBtn.dataset.copyEv]?.message || "";
-        if (msg) navigator.clipboard?.writeText(msg).then(() => toast("Copied Guardian prompt"), () => toast("Copy unavailable"));
-      }
+  function toast(t) {
+    const el = $("toast");
+    el.textContent = t;
+    el.classList.add("on");
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove("on"), 1700);
+  }
+
+  // --- Popover polyfill fallback for older browsers (CSP forbids external scripts) ---
+  function setupPopoverFallback() {
+    if (Object.hasOwn(HTMLElement.prototype, "popover")) return;
+    const pop = $("filtersPopover");
+    const btn = $("filterBtn");
+    if (!pop || !btn) return;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pop.classList.toggle(":popover-open");
+    });
+    document.addEventListener("click", (e) => {
+      if (!pop.contains(e.target) && e.target !== btn) pop.classList.remove(":popover-open");
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") pop.classList.remove(":popover-open");
     });
   }
-  bindRoot($("main"));
-  bindRoot($("sheetDetail"));
 
-  $("overviewBtn").onclick = () => renderOverview(true);
+  // --- Mobile sticky header hide-on-scroll fallback for browsers without scroll-state ---
+  function setupHeaderHideFallback() {
+    if (CSS.supports("container-type", "scroll-state")) return;
+    const bar = $("topBar");
+    let lastY = window.scrollY;
+    window.addEventListener("scroll", () => {
+      if (isWide()) {
+        bar.classList.remove("is-hidden");
+        return;
+      }
+      const maxY = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+      const y = Math.max(0, Math.min(window.scrollY, maxY));
+      if (y === lastY) return;
+      bar.classList.toggle("is-hidden", y > lastY && y > bar.offsetHeight);
+      lastY = y;
+    }, { passive: true });
+  }
+
+  // --- Event bindings ---
+  $("main").addEventListener("toggle", (e) => {
+    const det = e.target;
+    if (!(det instanceof HTMLDetailsElement) || !det.dataset.cardId) return;
+    const id = det.dataset.cardId;
+    if (det.open) { expandedCards.add(id); collapsedCards.delete(id); }
+    else { expandedCards.delete(id); collapsedCards.add(id); }
+  }, true);
+
+  $("main").addEventListener("click", (e) => {
+    const expBtn = e.target.closest("[data-toggle-expand]");
+    if (expBtn) {
+      expandAllCards = !expandAllCards;
+      if (!expandAllCards) { expandedCards.clear(); collapsedCards.clear(); }
+      renderDetail(false, true);
+      return;
+    }
+    const jb = e.target.closest("[data-jump-bot]");
+    if (jb) {
+      if (isWide()) {
+        const m = $("main");
+        m.scrollTo({ top: m.scrollHeight, behavior: "smooth" });
+      } else {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
+      }
+      return;
+    }
+    const modeBtn = e.target.closest("[data-mode]");
+    if (modeBtn) {
+      pinnedChatMode = modeBtn.dataset.mode;
+      const s = filtered[selIdx];
+      renderDetail(false, true);
+      if (pinnedChatMode === "all" && s) fetchSessionDetail(s, false);
+      return;
+    }
+    const act = e.target.closest("[data-act]");
+    if (act) {
+      const a = act.dataset.act;
+      if (a === "back") backToList(false);
+      else if (a === "back-health") {
+        viewMode = "sessions";
+        mobileView = "list";
+        syncLayoutMode();
+        renderList(false);
+      } else if (a === "prev") openAt(selIdx - 1, false);
+      else if (a === "next") openAt(selIdx + 1, false);
+      return;
+    }
+    const jHost = e.target.closest("[data-jump-host]");
+    if (jHost) {
+      fScope = "all";
+      fHost = jHost.dataset.jumpHost;
+      fState = "all";
+      fProject = "all";
+      viewMode = "sessions";
+      mobileView = "list";
+      selKey = null;
+      syncLayoutMode();
+      renderList(true);
+      return;
+    }
+    const kpi = e.target.closest("[data-kpi]");
+    if (kpi) {
+      fScope = "prompted";
+      fState = kpi.dataset.kpi;
+      viewMode = "sessions";
+      mobileView = "list";
+      selKey = null;
+      syncLayoutMode();
+      renderList(true);
+      return;
+    }
+    const jKey = e.target.closest("[data-jump-key]");
+    if (jKey) {
+      openKey(jKey.dataset.jumpKey);
+      return;
+    }
+    const themeBtn = e.target.closest("[data-theme-opt]");
+    if (themeBtn) {
+      setTheme(themeBtn.dataset.themeOpt);
+      return;
+    }
+    const cmdBtn = e.target.closest("[data-copy-cmd]");
+    if (cmdBtn) {
+      navigator.clipboard?.writeText(cmdBtn.dataset.copyCmd).then(() => toast("Copied"), () => toast(cmdBtn.dataset.copyCmd));
+      return;
+    }
+    const evBtn = e.target.closest("[data-copy-ev]");
+    if (evBtn) {
+      const s = filtered[selIdx];
+      const cached = s ? sessionCache.get(s.key) : null;
+      const rawEvents = (cached?.events?.length) ? cached.events : (s?.events || []);
+      const timeline = buildTimeline(rawEvents, effectiveChatMode(s) === "all");
+      const msg = timeline[+evBtn.dataset.copyEv]?.message || "";
+      if (msg) navigator.clipboard?.writeText(msg).then(() => toast("Copied prompt"), () => toast("Copy unavailable"));
+    }
+  });
+
+  $("tabSessions").onclick = () => {
+    viewMode = "sessions";
+    if (!isWide()) mobileView = "list";
+    syncLayoutMode();
+    renderList(true);
+  };
+  $("tabHealth").onclick = () => {
+    viewMode = "health";
+    if (!isWide()) mobileView = "health";
+    syncLayoutMode();
+    renderHealth(true);
+    if (!isWide()) window.scrollTo(0, 0);
+  };
+
   $("scopeTabs").onclick = (e) => {
     const b = e.target.closest("[data-scope]");
     if (!b) return;
     fScope = b.dataset.scope;
     selKey = null;
-    renderList();
+    renderList(true);
   };
-  $("kpiGrid").onclick = (e) => {
-    const btn = e.target.closest("[data-kpi]");
-    if (!btn) return;
-    const target = btn.dataset.kpi;
-    fScope = "prompted";
-    fState = fState === target ? "all" : target;
-    viewMode = "session";
-    selKey = null;
-    renderList();
+  $("filterHost").onchange = (e) => { fHost = e.target.value; selKey = null; renderList(true); };
+  $("filterState").onchange = (e) => { fState = e.target.value; selKey = null; renderList(true); };
+  $("filterProject").onchange = (e) => { fProject = e.target.value; selKey = null; renderList(true); };
+  $("resetFiltersBtn").onclick = () => {
+    fHost = "all"; fState = "all"; fProject = "all";
+    renderList(true);
   };
-  $("hostChips").onclick = (e) => { const b = e.target.closest("[data-host]"); if (b) { fHost = b.dataset.host; renderList(); } };
-  $("stateChips").onclick = (e) => { const b = e.target.closest("[data-st]"); if (b) { fState = b.dataset.st; renderList(); } };
-  $("projectChips").onclick = (e) => { const b = e.target.closest("[data-proj]"); if (b) { fProject = b.dataset.proj; renderList(); } };
-  $("searchInput").addEventListener("input", renderList);
-  $("list").onclick = (e) => { const r = e.target.closest(".row"); if (r) openAt(+r.dataset.i); };
-  $("bd").onclick = closeSheet;
-  $("side").addEventListener("scroll", () => $("navbar").classList.toggle("solid", $("side").scrollTop > 34), { passive: true });
-  addEventListener("keydown", (e) => {
-    if (e.target.tagName === "INPUT") return;
-    if (e.key === "Escape" && !isWide()) closeSheet();
-    if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); openAt(Math.min(filtered.length - 1, selIdx + 1)); }
-    if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); openAt(Math.max(0, selIdx - 1)); }
-  });
-  addEventListener("resize", () => { if (isWide()) closeSheet(); renderList(); });
+  $("activeFilters").onclick = (e) => {
+    const b = e.target.closest("[data-clear]");
+    if (!b) return;
+    const c = b.dataset.clear;
+    if (c === "host" || c === "all") fHost = "all";
+    if (c === "state" || c === "all") fState = "all";
+    if (c === "project" || c === "all") fProject = "all";
+    renderList(true);
+  };
+  $("filtersPopover").onclick = (e) => {
+    const t = e.target.closest("[data-theme-opt]");
+    if (t) setTheme(t.dataset.themeOpt);
+  };
 
-  applyTheme();
-  if ($("themeBtn")) {
-    $("themeBtn").onclick = () => {
-      themeMode = themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
-      try { localStorage.setItem("ig_theme", themeMode); } catch {}
-      applyTheme();
-    };
+  $("searchInput").addEventListener("input", () => renderList(true));
+  $("clearSearch").onclick = () => {
+    $("searchInput").value = "";
+    $("searchInput").focus();
+    renderList(true);
+  };
+  $("list").onclick = (e) => {
+    const r = e.target.closest(".row");
+    if (r) openAt(+r.dataset.i, true);
+  };
+
+  window.addEventListener("popstate", () => {
+    if (!isWide() && mobileView !== "list") {
+      backToList(true);
+    }
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); openAt(Math.min(filtered.length - 1, selIdx + 1), false); }
+    if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); openAt(Math.max(0, selIdx - 1), false); }
+  });
+  window.addEventListener("resize", () => {
+    syncLayoutMode();
+    renderList(false);
+  });
+
+  function markScrolling() {
+    userScrolling = true;
+    clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = setTimeout(() => {
+      userScrolling = false;
+      if (pendingSyncData) {
+        const d = pendingSyncData;
+        pendingSyncData = null;
+        state = d;
+        renderList(false);
+      }
+    }, 300);
   }
+  window.addEventListener("scroll", markScrolling, { passive: true });
+  $("side").addEventListener("scroll", markScrolling, { passive: true });
+  $("main").addEventListener("scroll", markScrolling, { passive: true });
+
   async function syncLive(manual) {
     if (document.hidden && !manual) return;
     if (manual) $("refreshBtn").classList.add("spin");
     try {
       const res = await fetch("/api/state", { cache: "no-store" });
       if (res.ok) {
-        state = await res.json();
-        const hasSel = !manual && Boolean(window.getSelection()?.toString()?.trim());
-        renderList(hasSel);
+        const data = await res.json();
+        if (!manual && userScrolling) {
+          pendingSyncData = data;
+        } else {
+          state = data;
+          const hasSel = !manual && Boolean(window.getSelection()?.toString()?.trim());
+          if (!hasSel) renderList(manual);
+        }
       }
     } catch {}
     if (manual) setTimeout(() => $("refreshBtn").classList.remove("spin"), 350);
   }
+
+  applyTheme(getStoredTheme());
+  setupPopoverFallback();
+  setupHeaderHideFallback();
+  syncLayoutMode();
   $("refreshBtn").onclick = () => syncLive(true);
   syncLive(false);
-  setInterval(() => syncLive(false), 4000);
+  setInterval(() => syncLive(false), 8000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) syncLive(false); });
 }
 
@@ -1142,250 +1495,365 @@ function dashboardHtml() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>try{var s=localStorage.getItem("color-scheme");if(s==="light"||s==="dark"){document.querySelector('meta[name="color-scheme"]').content=s;document.documentElement.dataset.theme=s;}}catch(e){}</script>
 <meta name="robots" content="noindex,nofollow">
-<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Intent Guardian</title>
 <style>
 :root{
-  --accent:#007AFF;--accent-soft:rgba(0,122,255,.12);
-  --green:#34C759;--green-soft:rgba(52,199,89,.14);
-  --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.15);
-  --red:#FF3B30;--red-soft:rgba(255,59,48,.14);
-  --purple:#AF52DE;--teal:#30B0C7;--indigo:#5856D6;--pink:#FF2D55;--pink-soft:rgba(255,45,85,.14);
-  --bg:#F2F2F7;--card:#FFFFFF;--label:#101114;--label-2:rgba(60,60,67,.62);--label-3:rgba(60,60,67,.36);
-  --sep:rgba(60,60,67,.16);--fill:rgba(118,118,128,.12);--bar:rgba(249,249,249,.86);
-  --text:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,"Helvetica Neue",Arial,sans-serif;
-  --round:ui-rounded,"SF Pro Rounded","SF Pro Display",-apple-system,system-ui,sans-serif;
+  --bg-l:#FFFFFF;--bg-2-l:#F7F7F8;--hover-l:#EFEFF1;--sel-l:#ECEEF2;--border-l:rgba(17,19,24,.09);
+  --text-l:#111318;--text-2-l:#59606D;--text-3-l:#858C99;--accent-l:#1D4ED8;--accent-soft-l:rgba(29,78,216,.09);
+  --bar-l:rgba(255,255,255,.92);--sb-track-l:#F3F4F6;--sb-thumb-l:#C4C9D4;
+
+  --bg-d:#0E1014;--bg-2-d:#13161C;--hover-d:#1B1F27;--sel-d:#202530;--border-d:rgba(255,255,255,.09);
+  --text-d:#ECEEF2;--text-2-d:#939AA6;--text-3-d:#646B78;--accent-d:#60A5FA;--accent-soft-d:rgba(96,165,250,.14);
+  --bar-d:rgba(14,16,20,.92);--sb-track-d:#161920;--sb-thumb-d:#3A4150;
+
+  --bg:var(--bg-l);--bg-2:var(--bg-2-l);--hover:var(--hover-l);--sel:var(--sel-l);--border:var(--border-l);
+  --text:var(--text-l);--text-2:var(--text-2-l);--text-3:var(--text-3-l);--accent:var(--accent-l);--accent-soft:var(--accent-soft-l);
+  --bar:var(--bar-l);--sb-track:var(--sb-track-l);--sb-thumb:var(--sb-thumb-l);
+
+  --green:#16A34A;--amber:#D97706;--red:#DC2626;--rose:#DB2777;
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter",system-ui,sans-serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;
-  --ease:cubic-bezier(.32,.72,0,1);--st:env(safe-area-inset-top,0px);--sb:env(safe-area-inset-bottom,0px);
+  --st:env(safe-area-inset-top,0px);--sb:env(safe-area-inset-bottom,0px);
+
+  color-scheme:light dark;
+  scrollbar-color:var(--sb-thumb) var(--sb-track);
 }
+:root:has(> head > meta[name="color-scheme"][content="dark"]){color-scheme:dark}
+:root:has(> head > meta[name="color-scheme"][content="light"]){color-scheme:light}
 @media (prefers-color-scheme:dark){
   :root:not([data-theme="light"]){
-    --accent:#0A84FF;--accent-soft:rgba(10,132,255,.2);
-    --green:#30D158;--green-soft:rgba(48,209,88,.18);
-    --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.18);
-    --red:#FF453A;--red-soft:rgba(255,69,58,.18);
-    --pink:#FF375F;--pink-soft:rgba(255,55,95,.2);
-    --bg:#000000;--card:#1C1C1E;--label:#FFFFFF;--label-2:rgba(235,235,245,.62);--label-3:rgba(235,235,245,.34);
-    --sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);--bar:rgba(22,22,24,.86);
+    --bg:var(--bg-d);--bg-2:var(--bg-2-d);--hover:var(--hover-d);--sel:var(--sel-d);--border:var(--border-d);
+    --text:var(--text-d);--text-2:var(--text-2-d);--text-3:var(--text-3-d);--accent:var(--accent-d);--accent-soft:var(--accent-soft-d);
+    --bar:var(--bar-d);--sb-track:var(--sb-track-d);--sb-thumb:var(--sb-thumb-d);
   }
 }
 html[data-theme="dark"]{
-  color-scheme:dark;
-  --accent:#0A84FF;--accent-soft:rgba(10,132,255,.2);
-  --green:#30D158;--green-soft:rgba(48,209,88,.18);
-  --orange:#FF9F0A;--orange-soft:rgba(255,159,10,.18);
-  --red:#FF453A;--red-soft:rgba(255,69,58,.18);
-  --pink:#FF375F;--pink-soft:rgba(255,55,95,.2);
-  --bg:#000000;--card:#1C1C1E;--label:#FFFFFF;--label-2:rgba(235,235,245,.62);--label-3:rgba(235,235,245,.34);
-  --sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);--bar:rgba(22,22,24,.86);
+  --bg:var(--bg-d);--bg-2:var(--bg-2-d);--hover:var(--hover-d);--sel:var(--sel-d);--border:var(--border-d);
+  --text:var(--text-d);--text-2:var(--text-2-d);--text-3:var(--text-3-d);--accent:var(--accent-d);--accent-soft:var(--accent-soft-d);
+  --bar:var(--bar-d);--sb-track:var(--sb-track-d);--sb-thumb:var(--sb-thumb-d);
 }
-html[data-theme="light"]{color-scheme:light}
+@supports (color:light-dark(white,black)){
+  :root{
+    --bg:light-dark(var(--bg-l),var(--bg-d));
+    --bg-2:light-dark(var(--bg-2-l),var(--bg-2-d));
+    --hover:light-dark(var(--hover-l),var(--hover-d));
+    --sel:light-dark(var(--sel-l),var(--sel-d));
+    --border:light-dark(var(--border-l),var(--border-d));
+    --text:light-dark(var(--text-l),var(--text-d));
+    --text-2:light-dark(var(--text-2-l),var(--text-2-d));
+    --text-3:light-dark(var(--text-3-l),var(--text-3-d));
+    --accent:light-dark(var(--accent-l),var(--accent-d));
+    --accent-soft:light-dark(var(--accent-soft-l),var(--accent-soft-d));
+    --bar:light-dark(var(--bar-l),var(--bar-d));
+    --sb-track:light-dark(var(--sb-track-l),var(--sb-track-d));
+    --sb-thumb:light-dark(var(--sb-thumb-l),var(--sb-thumb-d));
+  }
+}
+@supports not (scrollbar-color:auto){
+  *{scrollbar-width:auto}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--sb-thumb);border-radius:5px}
+  ::-webkit-scrollbar-track{background:var(--sb-track)}
+}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;color-scheme:light dark}
-body{font-family:var(--text);background:var(--bg);color:var(--label);-webkit-font-smoothing:antialiased;overscroll-behavior:none;font-size:15px}
-button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+html{font-family:var(--font);background:var(--bg);color:var(--text);font-size:15px;-webkit-font-smoothing:antialiased;container-type:scroll-state;scroll-padding-top:56px}
+body{min-height:100dvh;background:var(--bg)}
+button,input,select{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
 a{color:inherit}
-svg{display:block}
-.shell{height:100dvh;display:flex;overflow:hidden}
-.side{width:100%;height:100%;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;position:relative;padding-bottom:calc(24px + var(--sb))}
-.main{display:none}
-@media (min-width:760px){
-  .side{width:380px;flex:none;border-right:.5px solid var(--sep);padding-bottom:24px}
-  .main{display:block;flex:1;height:100%;overflow:hidden;position:relative;background:var(--bg)}
-}
-@media (min-width:1160px){.side{width:420px}}
-.navbar{position:sticky;top:0;z-index:20;height:calc(44px + var(--st));padding-top:var(--st);display:flex;align-items:center;justify-content:center;border-bottom:.5px solid transparent;transition:background .2s,border-color .2s}
-.navbar.solid{background:var(--bar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom-color:var(--sep)}
-.navbar .t{font-weight:600;font-size:17px;opacity:0;transition:opacity .2s}
-.navbar.solid .t{opacity:1}
-.navbar .r{position:absolute;right:12px;top:calc(var(--st) + 6px);display:flex;gap:6px;align-items:center}
-.pill-btn{height:30px;padding:0 10px;border-radius:15px;background:var(--fill);color:var(--accent);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:4px}
-.pill-btn.on{background:var(--accent);color:#fff}
-.ib{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;color:var(--accent)}
-.ib svg{width:19px;height:19px}
-.ib.spin svg{animation:spin .8s linear infinite}
+
+/* Top bar */
+.top-bar{position:sticky;top:0;z-index:30;height:calc(48px + var(--st));padding:var(--st) 14px 0;background:var(--bar);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;transition:transform .2s ease}
+.brand{display:flex;align-items:center;gap:8px;min-width:0}
+.brand-name{font-size:15px;font-weight:600;letter-spacing:-.2px;white-space:nowrap}
+.w-dot{width:7px;height:7px;border-radius:50%;background:var(--text-3);flex:none}
+.w-dot.on{background:var(--green)}
+.w-dot.stale{background:var(--amber)}
+.top-actions{display:flex;align-items:center;gap:8px}
+.icon-btn{width:30px;height:30px;border-radius:7px;display:inline-grid;place-items:center;color:var(--text-2);border:1px solid transparent;transition:background .12s,color .12s}
+.icon-btn:hover{background:var(--hover);color:var(--text)}
+.icon-btn:disabled{opacity:.35;pointer-events:none}
+.icon-btn svg{width:16px;height:16px}
+.icon-btn.spin svg{animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.large{padding:0 18px 2px;margin-top:-2px}
-.large h1{font-family:var(--round);font-size:32px;font-weight:700;letter-spacing:-.5px}
-.status{display:flex;align-items:center;gap:6px;margin-top:4px;font-size:12.5px;color:var(--label-2)}
-.status i{width:7px;height:7px;border-radius:50%;background:var(--label-3);flex:none}
-.status.live i{background:var(--green);box-shadow:0 0 0 3px var(--green-soft)}
-.watcher-pill{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11.5px;color:var(--label-2);background:var(--card);padding:5px 10px;border-radius:9px}
-.watcher-pill i{width:6px;height:6px;border-radius:50%;background:var(--label-3);flex:none}
-.watcher-pill.on i{background:var(--green)}
-.watcher-pill.stale i{background:var(--orange)}
-.kpi-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:10px 16px 0}
-.kpi{background:var(--card);border-radius:11px;padding:9px 11px;text-align:left;transition:transform .12s,background .15s}
-.kpi-btn:active{transform:scale(.97)}
-.kpi-btn.on{background:var(--label);color:var(--bg)}
-.kpi-btn.on .kl,.kpi-btn.on .ks{color:var(--bg);opacity:.78}
-.kv{font-family:var(--round);font-size:20px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
-.kl{font-size:11.5px;font-weight:600;margin-top:2px}
-.ks{font-size:11px;color:var(--label-2);margin-top:1px}
-.seg{display:inline-flex;background:var(--fill);padding:2px;border-radius:9px;gap:2px}
-.seg.full{display:flex;margin:10px 16px 0}
-.seg.full .seg-b{flex:1;text-align:center;justify-content:center}
-.seg-b{height:26px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:600;color:var(--label-2);display:inline-flex;align-items:center;white-space:nowrap;transition:background .15s,color .15s}
-.seg-b.on{background:var(--card);color:var(--label);box-shadow:0 1px 2px rgba(0,0,0,.08)}
-.search{margin:9px 16px 0;display:flex;align-items:center;gap:7px;background:var(--fill);border-radius:10px;height:36px;padding:0 10px;color:var(--label-2)}
-.search svg{width:16px;height:16px;flex:none}
-.search input{flex:1;border:0;background:none;font:inherit;font-size:15px;color:var(--label);outline:none;min-width:0}
-.search input::placeholder{color:var(--label-2)}
-.chips{display:flex;gap:7px;overflow-x:auto;padding:9px 16px 0;scrollbar-width:none}
-.chips::-webkit-scrollbar{display:none}
-.chip{flex:none;height:30px;padding:0 11px;border-radius:15px;background:var(--card);font-size:13px;font-weight:500;display:flex;align-items:center;gap:6px;box-shadow:0 .5px 1px rgba(0,0,0,.05);transition:transform .12s,background .15s}
-.chip:active{transform:scale(.96)}
-.chip .d{width:7px;height:7px;border-radius:50%}
-.chip .n{color:var(--label-2);font-weight:400;font-variant-numeric:tabular-nums}
-.chip.on{background:var(--label);color:var(--bg)}
-.chip.on .n{color:var(--bg);opacity:.72}
-.sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:16px 28px 6px}
-.group{margin:0 16px;background:var(--card);border-radius:12px;overflow:hidden}
-.row{display:flex;align-items:center;gap:11px;padding:10px 14px 10px 12px;width:100%;text-align:left;position:relative;transition:background .12s}
-.row:active{background:var(--fill)}
-.row.sel{background:var(--accent);color:#fff}
-.row.sel .rs,.row.sel .chev,.row.sel .rt2,.row.sel .rsub{color:rgba(255,255,255,.82)}
-.row.sel .badge-pill{background:rgba(255,255,255,.22);color:#fff}
-.row+.row::before{content:"";position:absolute;top:0;left:64px;right:0;border-top:.5px solid var(--sep)}
-.row.sel::before,.row.sel+.row::before{display:none}
-.av{width:42px;height:42px;border-radius:11px;flex:none;display:grid;place-items:center;font-family:var(--round);font-weight:700;font-size:14px;letter-spacing:-.3px;position:relative}
-.av .dot{position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border-radius:50%;border:2px solid var(--card)}
-.rt{flex:1;min-width:0}
-.rt-top{display:flex;align-items:baseline;gap:6px;min-width:0}
-.rn{font-size:15.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
-.rt2{font-size:12px;color:var(--label-3);flex:none;font-variant-numeric:tabular-nums}
-.rsub{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--label-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rs{font-size:13px;color:var(--label-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
-.chev{width:8px;height:14px;color:var(--label-3);flex:none}
-@media (min-width:760px){.chev{display:none}}
-.badge-pill{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;padding:1.5px 7px;border-radius:6px;line-height:1.3;flex:none}
-.st-ongoing{background:var(--accent-soft);color:var(--accent)}
-.st-completed{background:var(--green-soft);color:var(--green)}
-.st-pending{background:var(--orange-soft);color:var(--orange)}
-.st-error{background:var(--red-soft);color:var(--red)}
-.st-manual{background:var(--pink-soft);color:var(--pink)}
-.st-stopped{background:var(--fill);color:var(--label-2)}
-.empty{text-align:center;color:var(--label-2);padding:48px 20px;font-size:14px}
-.detail{height:100%;display:flex;flex-direction:column;background:var(--bg);position:relative}
-.d-top{min-height:52px;padding:6px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;background:var(--bar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--sep);flex:none}
-.d-top .tt{font-weight:600;font-size:15.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:140px}
-.navs{display:flex;gap:5px;align-items:center;flex:none;flex-wrap:wrap;max-width:100%}
-@media (max-width:520px){
-  .d-top{padding:6px 10px;gap:6px}
-  .seg-b{padding:0 7px;font-size:11px}
-  .pos{min-width:24px;font-size:11px}
+
+/* Hide mobile top-bar on scroll down, restore on scroll up */
+@media (max-width:899px){
+  @container scroll-state((scrolled:bottom) and (scrollable:top)){
+    .top-bar{transform:translateY(-100%)}
+  }
+  .top-bar.is-hidden:not(:focus-within){transform:translateY(-100%)}
+  .top-bar:focus-within{transform:none}
 }
-.glass{width:28px;height:28px;border-radius:50%;background:var(--fill);color:var(--accent);display:grid;place-items:center}
-.glass svg{width:13px;height:13px}
-.glass:disabled{opacity:.32;pointer-events:none}
-.pos{font-size:12px;color:var(--label-2);font-variant-numeric:tabular-nums;min-width:30px;text-align:center}
-.main .close-btn{display:none}
-.d-scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:16px 18px calc(28px + var(--sb))}
-.hero-card{background:var(--card);border-radius:14px;padding:15px;display:flex;flex-direction:column;gap:11px}
-.hero-row{display:flex;align-items:flex-start;gap:12px}
-.hero-meta{flex:1;min-width:0}
-.hero-meta h2{font-family:var(--round);font-size:20px;font-weight:700;letter-spacing:-.3px;word-break:break-word}
-.hero-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.tag{font-size:12px;font-weight:500;padding:3px 9px;border-radius:8px;background:var(--fill);color:var(--label-2)}
-.sid{font-family:var(--mono);font-size:11.5px;color:var(--label-2);word-break:break-all;margin-top:2px}
-.acts{display:flex;flex-wrap:wrap;gap:8px}
-.act{flex:1;min-width:130px;height:36px;border-radius:10px;background:var(--accent-soft);color:var(--accent);font-size:13px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;padding:0 12px;transition:transform .1s}
-.act:active{transform:scale(.97)}
-.act.primary{background:var(--accent);color:#fff}
-.act svg{width:15px;height:15px;flex:none}
-.ev-sec{font-size:12px;font-weight:600;color:var(--label-2);text-transform:uppercase;letter-spacing:.35px;margin:16px 4px 8px}
-.ev-sec-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 4px 8px}
-.ev-sec-row .ev-sec{margin:0}
-.ev-more{margin-top:4px;border-top:.5px solid var(--sep);padding-top:6px}
-.ev-more summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--accent);list-style:none;user-select:none;display:inline-flex;align-items:center;gap:5px}
-.ev-more summary::-webkit-details-marker{display:none}
-.ev-more summary::before{content:"▸";font-size:11px;transition:transform .15s}
-.ev-more[open] summary::before{transform:rotate(90deg)}
-.funnel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.jump-bot{position:absolute;right:18px;bottom:calc(18px + var(--sb));z-index:25;background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;padding:7px 13px;border-radius:18px;box-shadow:0 4px 16px rgba(0,0,0,.22);transition:transform .15s}
-.jump-bot:active{transform:scale(.95)}
-.jump-bot[hidden]{display:none}
-.hint-banner{background:var(--fill);color:var(--label-2);font-size:12.5px;padding:9px 12px;border-radius:10px;margin-bottom:10px}
-.cards{display:flex;flex-direction:column;gap:10px}
-.chat-row{display:flex;width:100%}
-.chat-row.me{justify-content:flex-end}
-.chat-row.agent{justify-content:flex-start}
-.bubble{max-width:86%;background:var(--card);border-radius:14px;padding:11px 13px;display:flex;flex-direction:column;gap:5px;box-shadow:0 .5px 1px rgba(0,0,0,.05)}
-.bubble.me{background:var(--accent-soft);border-bottom-right-radius:4px}
-.bubble.me.manual{background:var(--pink-soft)}
-.bubble.agent{border-bottom-left-radius:4px}
-.b-head{display:flex;align-items:center;gap:7px;font-size:12px;flex-wrap:wrap}
-.b-head time{margin-left:auto;color:var(--label-2);font-size:11px;font-variant-numeric:tabular-nums}
-.ev-card{background:var(--card);border-radius:12px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;border-left:3px solid transparent;text-align:left;width:100%}
-.ev-card.k-correction{border-left-color:var(--accent)}
-.ev-card.k-error{border-left-color:var(--red)}
-.ev-card.k-manual_followup{border-left-color:var(--pink)}
-.ov-row:active{transform:scale(.99)}
-.ev-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.ev-head time{font-size:12px;color:var(--label-2);margin-left:auto;font-variant-numeric:tabular-nums}
-.ev-body{font-size:14px;line-height:1.48;white-space:pre-wrap;word-break:break-word;color:var(--label)}
-.ev-kv{display:flex;flex-direction:column;gap:6px;font-size:13.5px;line-height:1.45}
-.ev-kv b{font-size:11px;text-transform:uppercase;letter-spacing:.3px;color:var(--label-2);display:block;margin-bottom:1px}
-.ev-foot{display:flex;justify-content:flex-end}
-.mini-btn{font-size:12px;font-weight:600;color:var(--accent);background:var(--accent-soft);padding:4px 10px;border-radius:7px}
-.mini-btn:active{opacity:.75}
-.plat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
-.plat-card{background:var(--card);border-radius:12px;padding:11px 12px;text-align:left;display:flex;flex-direction:column;gap:8px}
-.plat-card:active{transform:scale(.98)}
-.plat-head{display:flex;align-items:center;gap:9px}
-.plat-name{flex:1;min-width:0;display:flex;flex-direction:column}
-.plat-name strong{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.plat-name span{font-size:11.5px;color:var(--label-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.plat-sess{font-family:var(--round);font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
-.plat-stats{display:flex;flex-wrap:wrap;gap:8px;font-size:11.5px;color:var(--label-2)}
-.bd{position:fixed;inset:0;background:rgba(0,0,0,.42);opacity:0;pointer-events:none;transition:opacity .28s;z-index:40}
-.bd.on{opacity:1;pointer-events:auto}
-.sheet{position:fixed;left:0;right:0;bottom:0;top:calc(14px + var(--st));z-index:41;background:var(--bg);border-radius:14px 14px 0 0;transform:translateY(105%);transition:transform .38s var(--ease);overflow:hidden;box-shadow:0 -10px 40px rgba(0,0,0,.18)}
-.sheet.on{transform:translateY(0)}
-@media (min-width:760px){.sheet,.bd{display:none}}
-.toast{position:fixed;left:50%;bottom:calc(28px + var(--sb));transform:translate(-50%,16px);opacity:0;background:rgba(28,28,30,.92);color:#fff;font-size:13.5px;font-weight:500;padding:9px 16px;border-radius:20px;z-index:80;transition:all .25s var(--ease);pointer-events:none}
+
+/* Shell layout: real document scroll on mobile, 2-col independent scroll on desktop */
+.shell{display:block;min-height:calc(100dvh - 48px - var(--st))}
+.shell[data-wide="0"][data-view="list"] .main{display:none}
+.shell[data-wide="0"][data-view="detail"] .side,
+.shell[data-wide="0"][data-view="health"] .side{display:none}
+.shell[data-wide="0"][data-view="detail"] .top-bar{display:none}
+
+@media (min-width:900px){
+  html,body{height:100%;overflow:hidden}
+  .app-frame{height:100dvh;display:grid;grid-template-rows:48px minmax(0,1fr)}
+  .top-bar{position:relative;height:48px;padding:0 18px}
+  .shell{display:grid;grid-template-columns:360px minmax(0,1fr);height:100%;min-height:0;overflow:hidden}
+  .side{height:100%;overflow-y:auto;overscroll-behavior-y:contain;border-right:1px solid var(--border);background:var(--bg-2)}
+  .main{height:100%;overflow-y:auto;overscroll-behavior-y:contain;background:var(--bg);position:relative;container-type:scroll-state;container-name:detail-scroll;scroll-padding-top:64px;outline:none}
+}
+@media (min-width:1200px){
+  .shell{grid-template-columns:390px minmax(0,1fr)}
+}
+
+/* Segmented controls */
+.seg{display:inline-flex;background:var(--bg-2);border:1px solid var(--border);padding:2px;border-radius:8px;gap:2px}
+.seg-b{height:25px;padding:0 9px;border-radius:6px;font-size:12.5px;font-weight:500;color:var(--text-2);display:inline-flex;align-items:center;gap:5px;white-space:nowrap;transition:background .12s,color .12s}
+.seg-b span{font-size:11.5px;color:var(--text-3);font-variant-numeric:tabular-nums}
+.seg-b.on{background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.seg-b.on span{color:var(--text-2)}
+
+/* List toolbar */
+.list-toolbar{position:sticky;top:0;z-index:10;background:var(--bg-2);border-bottom:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+@media (max-width:899px){.list-toolbar{position:static;background:var(--bg)}}
+.search-box{display:flex;align-items:center;gap:7px;height:34px;padding:0 10px;border-radius:8px;background:var(--bg);border:1px solid var(--border)}
+.search-box:focus-within{border-color:var(--accent)}
+.search-box svg{width:14px;height:14px;color:var(--text-3);flex:none}
+.search-box input{flex:1;min-width:0;border:0;background:none;outline:none;font-size:13.5px}
+.search-box input::placeholder{color:var(--text-3)}
+.clear-x{font-size:15px;color:var(--text-3);padding:0 4px;line-height:1}
+.toolbar-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.filter-btn{height:29px;padding:0 10px;border-radius:7px;border:1px solid var(--border);background:var(--bg);font-size:12.5px;font-weight:500;color:var(--text-2);display:inline-flex;align-items:center;gap:6px}
+.filter-btn:hover{background:var(--hover);color:var(--text)}
+.filter-btn.active{border-color:var(--accent);color:var(--accent)}
+.f-badge{background:var(--accent);color:#fff;font-size:11px;font-weight:600;padding:0 5px;border-radius:9px;line-height:16px}
+.active-filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.active-filters[hidden]{display:none}
+.active-chip{font-size:12px;padding:2px 8px;border-radius:6px;background:var(--accent-soft);color:var(--accent);font-weight:500;display:inline-flex;align-items:center;gap:4px}
+.clear-all{font-size:12px;color:var(--text-2);padding:2px 6px}
+.clear-all:hover{color:var(--text)}
+
+/* Popover */
+.popover-panel{width:min(320px,calc(100vw - 24px));padding:14px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);box-shadow:0 12px 32px rgba(0,0,0,.14)}
+.popover-panel[popover]:is(:popover-open,.\:popover-open){display:flex;flex-direction:column;gap:12px;margin:auto}
+@supports not selector(:popover-open){[popover]:not(.\:popover-open){display:none}}
+.popover-panel::backdrop{background:rgba(0,0,0,.22)}
+.pop-field{display:flex;flex-direction:column;gap:4px}
+.pop-field label{font-size:11.5px;font-weight:600;color:var(--text-2);text-transform:uppercase;letter-spacing:.3px}
+.pop-field select{height:34px;padding:0 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg-2);font-size:13.5px}
+.pop-foot{display:flex;justify-content:flex-end;border-top:1px solid var(--border);padding-top:10px}
+.text-btn{font-size:12.5px;font-weight:500;color:var(--accent);padding:3px 6px;border-radius:5px}
+.text-btn:hover{background:var(--accent-soft)}
+
+/* Session List */
+.list-wrap{padding-bottom:calc(28px + var(--sb))}
+.sec{font-size:11.5px;font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.4px;padding:14px 14px 6px}
+.group{display:flex;flex-direction:column}
+.row{width:100%;text-align:left;padding:11px 14px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:3px;position:relative;transition:background .1s}
+.row:hover{background:var(--hover)}
+.row.sel{background:var(--sel)}
+.row.sel::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent)}
+.row-top{display:flex;align-items:center;gap:8px;min-width:0}
+.s-dot{width:7px;height:7px;border-radius:50%;flex:none}
+.dot-live{background:var(--green)}
+.dot-warn{background:var(--amber)}
+.dot-err{background:var(--red)}
+.dot-idle{border:1.5px solid var(--text-3);background:transparent}
+.row-title{flex:1;min-width:0;font-size:14px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.1px}
+.row-time{font-family:var(--mono);font-size:11.5px;color:var(--text-3);flex:none;font-variant-numeric:tabular-nums}
+.row-meta{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding-left:15px;font-size:12px;color:var(--text-2)}
+.sep-dot{color:var(--text-3)}
+.sig-warn{color:var(--amber);font-weight:550}
+.sig-err{color:var(--red);font-weight:550}
+.sig-manual{color:var(--rose);font-weight:500}
+.row-prev{padding-left:15px;font-size:12.5px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.empty,.empty-thread{padding:48px 20px;text-align:center;color:var(--text-2);font-size:14px}
+
+/* Detail Header (state-aware sticky header) */
+.d-top-wrap{position:sticky;top:0;z-index:20;container-type:scroll-state;container-name:detail-header}
+.d-top{background:var(--bar);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:10px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:box-shadow .18s}
+@container detail-header scroll-state(stuck:top){
+  .d-top{box-shadow:0 2px 10px rgba(0,0,0,.06)}
+}
+.d-top-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+.back-btn{display:none;font-size:13.5px;font-weight:550;color:var(--accent);padding:4px 8px 4px 2px;white-space:nowrap;flex:none}
+@media (max-width:899px){
+  .d-top{padding:10px 14px}
+  .back-btn{display:inline-flex;align-items:center}
+}
+.d-titles{min-width:0;flex:1}
+.d-tt{font-size:15.5px;font-weight:600;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.d-sub{font-size:12px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.d-acts{display:flex;align-items:center;gap:6px;flex:none}
+.ghost-btn{height:28px;padding:0 9px;border-radius:6px;border:1px solid var(--border);font-size:12px;font-weight:500;color:var(--text-2);display:inline-flex;align-items:center;text-decoration:none;white-space:nowrap}
+.ghost-btn:hover{background:var(--hover);color:var(--text)}
+.nav-pair{display:inline-flex;align-items:center;gap:2px}
+@media (max-width:600px){.ghost-btn[data-copy-cmd]{display:none}}
+
+/* Detail Body & Thread */
+.d-body{max-width:74ch;margin:0 auto;padding:14px 18px calc(72px + var(--sb));display:flex;flex-direction:column;gap:14px}
+@media (max-width:899px){.d-body{padding:12px 14px calc(72px + var(--sb))}}
+.d-controls{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.d-controls-r{display:flex;align-items:center;gap:8px;position:relative}
+.info-pop{position:relative}
+.info-pop summary{list-style:none;cursor:pointer}
+.info-pop summary::-webkit-details-marker{display:none}
+.info-card{position:absolute;right:0;top:28px;z-index:25;width:290px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);box-shadow:0 8px 24px rgba(0,0,0,.12);display:flex;flex-direction:column;gap:6px;font-size:12px}
+.info-card > div{display:flex;justify-content:space-between;gap:10px}
+.info-card span:first-child{color:var(--text-2)}
+.info-card code{font-family:var(--mono);font-size:11px;word-break:break-all;text-align:right}
+.hint-line{font-size:12.5px;color:var(--text-2);padding:8px 12px;border-radius:7px;background:var(--bg-2);border:1px solid var(--border)}
+
+.thread{display:flex;flex-direction:column;gap:12px}
+.msg{padding:12px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg)}
+.msg-user{background:var(--bg-2)}
+.msg-manual{background:var(--bg-2);border-color:rgba(219,39,119,.28)}
+.msg-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12.5px}
+.msg-head strong{font-weight:600}
+.msg-head time{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--text-3)}
+.tag-inline{font-size:11.5px;color:var(--rose);font-weight:500}
+.msg-body{font-size:14.5px;line-height:1.56;white-space:pre-wrap;word-break:break-word;color:var(--text)}
+.inline-more{margin-top:6px}
+.inline-more summary{font-size:12.5px;font-weight:500;color:var(--accent);cursor:pointer}
+.msg-body.full{margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
+
+.g-card{padding:13px 15px;border-radius:8px;border:1px solid var(--border);background:var(--bg);display:flex;flex-direction:column;gap:8px}
+.g-card.g-err{border-color:rgba(220,38,38,.32)}
+.g-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12.5px}
+.g-head strong{font-weight:600}
+.g-head time{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--text-3)}
+.g-status{font-size:12px;font-weight:500}
+.g-status.ok{color:var(--green)}
+.g-status.warn{color:var(--amber)}
+.g-status.muted{color:var(--text-2)}
+.ev-gap{font-size:14.5px;line-height:1.54;white-space:pre-wrap;word-break:break-word}
+.ev-more{border-top:1px solid var(--border);padding-top:8px}
+.ev-more summary{font-size:12.5px;font-weight:500;color:var(--text-2);cursor:pointer;user-select:none}
+.ev-kv{margin-top:8px;display:flex;flex-direction:column;gap:8px;font-size:13.5px;line-height:1.5}
+.ev-kv b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.3px;color:var(--text-3);margin-bottom:2px}
+
+/* Scroll-position-aware Latest button */
+.scroll-sentinel{height:1px;width:100%}
+.jump-bot{position:sticky;bottom:calc(16px + var(--sb));float:right;margin-right:18px;z-index:25;padding:7px 13px;border-radius:18px;background:var(--text);color:var(--bg);font-size:12.5px;font-weight:550;box-shadow:0 4px 16px rgba(0,0,0,.18);transition:opacity .2s,transform .2s;opacity:1}
+@media (max-width:899px){.jump-bot{position:fixed;right:16px;bottom:calc(16px + var(--sb));float:none;margin:0}}
+@supports (container-type:scroll-state){
+  .jump-bot{opacity:0;visibility:hidden;transform:translateY(8px);pointer-events:none}
+  @container detail-scroll scroll-state(scrollable:bottom){
+    .jump-bot{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
+  }
+}
+.main.at-bottom .jump-bot{opacity:0;visibility:hidden;pointer-events:none}
+
+/* Health view */
+.health-body{max-width:84ch;gap:18px}
+.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--border);gap:1px}
+.metric-cell{background:var(--bg);padding:13px 14px;text-align:left}
+.metric-btn:hover{background:var(--hover)}
+.m-val{font-family:var(--mono);font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.15}
+.m-lbl{font-size:12.5px;font-weight:550;margin-top:4px}
+.m-sub{font-size:12px;color:var(--text-2);margin-top:2px}
+.h-sec{font-size:12.5px;font-weight:600;color:var(--text-2);text-transform:uppercase;letter-spacing:.35px;margin-top:4px}
+.h-note{font-size:12.5px;color:var(--text-2);margin-top:-10px}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px}
+.plat-table{width:100%;border-collapse:collapse;font-size:13px}
+.plat-table th,.plat-table td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+.plat-table th{font-size:11.5px;font-weight:600;color:var(--text-2);background:var(--bg-2)}
+.plat-table tr:last-child td{border-bottom:0}
+.plat-row{cursor:pointer}
+.plat-row:hover td{background:var(--hover)}
+.plat-table .num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.muted{color:var(--text-2)}
+.manual-list{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:9px;overflow:hidden}
+.manual-row{width:100%;text-align:left;padding:11px 13px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
+.manual-row:last-child{border-bottom:0}
+.manual-row:hover{background:var(--hover)}
+.manual-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px}
+.manual-top span{color:var(--text-2)}
+.manual-top time{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--text-3)}
+.manual-msg{font-size:13.5px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.watcher-log{border:1px solid var(--border);border-radius:9px;padding:10px 13px;font-size:13px}
+.watcher-log summary{cursor:pointer;font-weight:550;color:var(--text-2)}
+.w-ev-list{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.w-ev{display:flex;gap:10px;font-size:12.5px;border-top:1px solid var(--border);padding-top:6px}
+.w-ev span:first-child{font-weight:600;color:var(--text-2);min-width:64px}
+.w-ev span:nth-child(2){flex:1;min-width:0;word-break:break-word}
+.w-ev time{font-family:var(--mono);font-size:11.5px;color:var(--text-3);flex:none}
+.health-foot{display:flex;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px solid var(--border)}
+
+.placeholder{height:100%;display:grid;place-items:center;color:var(--text-3);font-size:14px;padding:24px;text-align:center}
+.toast{position:fixed;left:50%;bottom:calc(24px + var(--sb));transform:translate(-50%,12px);opacity:0;background:var(--text);color:var(--bg);font-size:13px;font-weight:500;padding:8px 15px;border-radius:18px;z-index:80;transition:opacity .2s,transform .2s;pointer-events:none}
 .toast.on{transform:translate(-50%,0);opacity:1}
-.placeholder{height:100%;display:grid;place-items:center;color:var(--label-3);font-size:15px;text-align:center;padding:24px}
-.placeholder svg{width:44px;height:44px;margin:0 auto 10px}
 </style>
 </head>
 <body>
-<div class="shell">
-  <aside class="side" id="side">
-    <div class="navbar" id="navbar">
-      <div class="t">Intent Guardian</div>
-      <div class="r">
-        <button class="pill-btn" id="themeBtn" aria-label="Toggle theme">Auto</button>
-        <button class="pill-btn" id="overviewBtn" aria-label="Overview">Overview</button>
-        <button class="ib" id="refreshBtn" aria-label="Refresh">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-        </button>
+<div class="app-frame">
+  <header class="top-bar" id="topBar">
+    <div class="brand">
+      <span class="w-dot offline" id="watcherDot" aria-hidden="true"></span>
+      <span class="brand-name" id="watcherTitle">Intent Guardian</span>
+    </div>
+    <div class="top-actions">
+      <div class="seg" role="tablist" aria-label="View">
+        <button type="button" class="seg-b on" id="tabSessions" role="tab" aria-selected="true">Sessions</button>
+        <button type="button" class="seg-b" id="tabHealth" role="tab" aria-selected="false">Health</button>
       </div>
+      <button type="button" class="icon-btn" id="refreshBtn" aria-label="Refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      </button>
     </div>
-    <div class="large">
-      <h1>Intent Guardian</h1>
-      <div class="status" id="statusBar"><i></i><span>Connecting…</span></div>
-      <div class="watcher-pill" id="watcherBar"><i></i><span>Watcher · loading…</span></div>
-    </div>
-    <div class="kpi-grid" id="kpiGrid"></div>
-    <div class="seg full" id="scopeTabs"></div>
-    <label class="search">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4.2-4.2"/></svg>
-      <input id="searchInput" type="search" placeholder="Search title, session, project, prompt…" autocomplete="off">
-    </label>
-    <div class="chips" id="hostChips"></div>
-    <div class="chips" id="stateChips"></div>
-    <div class="chips" id="projectChips"></div>
-    <div id="list"></div>
-  </aside>
-  <main class="main" id="main">
-    <div class="placeholder"><div><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l7 4v5c0 5-3.5 8-7 9-3.5-1-7-4-7-9V7l7-4z"/></svg>Select a session to inspect prompts &amp; conversation</div></div>
-  </main>
+  </header>
+
+  <div class="shell" id="shell" data-wide="1" data-view="sessions">
+    <aside class="side" id="side">
+      <div class="list-toolbar">
+        <label class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4.2-4.2"/></svg>
+          <input id="searchInput" type="search" placeholder="Search sessions, projects, prompts…" autocomplete="off">
+          <button type="button" class="clear-x" id="clearSearch" aria-label="Clear search" hidden>×</button>
+        </label>
+        <div class="toolbar-row">
+          <div class="seg" id="scopeTabs" role="group" aria-label="Scope"></div>
+          <button type="button" class="filter-btn" id="filterBtn" popovertarget="filtersPopover">Filter <span class="f-badge" id="filterBadge" hidden></span></button>
+        </div>
+        <div class="active-filters" id="activeFilters" hidden></div>
+      </div>
+      <div class="list-wrap" id="list"></div>
+    </aside>
+    <main class="main" id="main" tabindex="-1">
+      <div class="placeholder">Select a session to inspect prompts &amp; activity</div>
+    </main>
+  </div>
 </div>
-<div class="bd" id="bd"></div>
-<div class="sheet" id="sheet" role="dialog" aria-modal="true"><div class="detail" id="sheetDetail"></div></div>
-<div class="toast" id="toast"></div>
+
+<div id="filtersPopover" class="popover-panel" popover="auto">
+  <div class="pop-field">
+    <label for="filterHost">Platform</label>
+    <select id="filterHost"></select>
+  </div>
+  <div class="pop-field">
+    <label for="filterState">Status</label>
+    <select id="filterState"></select>
+  </div>
+  <div class="pop-field">
+    <label for="filterProject">Project</label>
+    <select id="filterProject"></select>
+  </div>
+  <div class="pop-field">
+    <label>Appearance</label>
+    <div class="seg" role="group" aria-label="Appearance">
+      <button type="button" class="seg-b" data-theme-opt="system">System</button>
+      <button type="button" class="seg-b" data-theme-opt="light">Light</button>
+      <button type="button" class="seg-b" data-theme-opt="dark">Dark</button>
+    </div>
+  </div>
+  <div class="pop-foot">
+    <button type="button" class="text-btn" id="resetFiltersBtn">Reset filters</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script>(${clientApp.toString()})()</script>
 </body>
 </html>`;
