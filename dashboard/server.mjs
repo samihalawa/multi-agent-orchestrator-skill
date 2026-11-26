@@ -428,7 +428,7 @@ function clientApp() {
 
   let state = { serverTime: Date.now() / 1000, watcher: null, metrics: null, sessions: [], events: [] };
   let sessions = [], filtered = [];
-  let fScope = "prompted", fHost = "all", fState = "all", fProject = "all";
+  let fScope = "all", fHost = "all", fState = "all", fProject = "all";
   let selKey = null, selIdx = -1, viewMode = "session", chatMode = "prompts";
   const sessionCache = new Map();
   const expandedCards = new Set();
@@ -551,8 +551,8 @@ function clientApp() {
     `;
     const pCnt = sessions.filter((s) => s.isPrompted).length;
     $("scopeTabs").innerHTML = `
-      <button class="seg-b${fScope === "prompted" ? " on" : ""}" data-scope="prompted">Prompted · ${pCnt}</button>
       <button class="seg-b${fScope === "all" ? " on" : ""}" data-scope="all">All Monitored · ${sessions.length}</button>
+      <button class="seg-b${fScope === "prompted" ? " on" : ""}" data-scope="prompted">Prompted · ${pCnt}</button>
     `;
     $("overviewBtn").classList.toggle("on", viewMode === "overview");
   }

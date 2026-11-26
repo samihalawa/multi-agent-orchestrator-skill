@@ -1249,6 +1249,85 @@ class GuardianContracts(unittest.TestCase):
         self.assertEqual(len(reloaded.get("chat_turns", [])), 2)
         self.assertAlmostEqual(reloaded["chat_turns"][0]["at"], g._parse_iso_ts("2026-11-25T11:00:00Z"), places=2)
 
+    def test_v21_antigravity_session_start_and_post_invocation_user_markdown(self):
+        cfg = {**self.cfg, "feed_url": "https://intent-guardian.megawebs.com/events", "checkpoint_every": 1}
+        state_dir = self.root / "state"
+        # 1. SessionStart emits PRIOR_INSISTENCE_REMINDER + user_markdown
+        out_start, _ = g.process_event(
+            {"conversationId": "agy-vis-1", "hookEventName": "SessionStart"},
+            "antigravity", cfg, state_dir, self.reviewer,
+        )
+        step_start = out_start["injectSteps"][0]["systemMessage"]
+        self.assertEqual(step_start["systemMessage"], g.PRIOR_INSISTENCE_REMINDER)
+        self.assertIn("Intent Guardian", step_start["metadata"]["user_markdown"])
+        self.assertIn("https://intent-guardian.megawebs.com/", step_start["metadata"]["user_markdown"])
+
+        # 2. Clean PostInvocation emits empty systemMessage + user_markdown badge and no terminationBehavior
+        transcript = self.root / "agy_vis.jsonl"
+        transcript.write_text("\n".join([
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nCheck status\n</USER_REQUEST>"}),
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Checking status now."}),
+        ]) + "\n")
+        g.process_event(
+            {"conversationId": "agy-vis-1", "hookEventName": "PostToolUse", "transcriptPath": str(transcript),
+             "toolCall": {"id": "t1", "name": "run_command", "args": {"CommandLine": "ls"}}},
+            "antigravity", cfg, state_dir, self.reviewer,
+        )
+        out_clean, _ = g.process_event(
+            {"conversationId": "agy-vis-1", "hookEventName": "PostInvocation", "transcriptPath": str(transcript)},
+            "antigravity", cfg, state_dir,
+            lambda c, p: ({"intervene": False, "resolved": False, "completed": False, "evidence_ids": [p["intent"][0]["id"]], "state_delta": "Checked."}, {"model": "gpt-6-luna", "usage": {}}),
+        )
+        step_clean = out_clean["injectSteps"][0]["systemMessage"]
+        self.assertEqual(step_clean["systemMessage"], "")
+        self.assertIn("Intent Guardian", step_clean["metadata"]["user_markdown"])
+        self.assertIn("on track", step_clean["metadata"]["user_markdown"])
+        self.assertNotIn("terminationBehavior", out_clean)
+        self.assertEqual(g.records({"step_index": 2, "type": "SYSTEM_MESSAGE", "content": ""}, "antigravity", 3), [])
+
+        # 3. PostInvocation intervention emits GUARDIAN_TAG + user_markdown + force_continue
+        transcript.write_text(transcript.read_text() + json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Still checking."}) + "\n")
+        g.process_event(
+            {"conversationId": "agy-vis-1", "hookEventName": "PostToolUse", "transcriptPath": str(transcript),
+             "toolCall": {"id": "t2", "name": "run_command", "args": {"CommandLine": "pwd"}}},
+            "antigravity", cfg, state_dir, self.reviewer,
+        )
+        out_int, _ = g.process_event(
+            {"conversationId": "agy-vis-1", "hookEventName": "PostInvocation", "transcriptPath": str(transcript)},
+            "antigravity", cfg, state_dir,
+            lambda c, p: ({"intervene": True, "verdict_domain": "active_route", "reason": "Missing verification.",
+                           "next_action": "Run verification now.", "proof_needed": "Verified output.",
+                           "evidence_ids": [p["intent"][0]["id"]]}, {"model": "gpt-6-luna", "usage": {}}),
+        )
+        step_int = out_int["injectSteps"][0]["systemMessage"]
+        self.assertIn(g.GUARDIAN_TAG, step_int["systemMessage"])
+        self.assertIn("Action Required", step_int["metadata"]["user_markdown"])
+        self.assertEqual(out_int.get("terminationBehavior"), "force_continue")
+
+    def test_v21_publish_feed_uses_configurable_five_second_timeout(self):
+        from unittest import mock
+        tok_file = self.root / "feed_tok"
+        tok_file.write_text("secret-token\n")
+        state = g.initial_state("feed-timeout-1", "antigravity")
+        state["last_seen"] = 1795670000.0
+        seen_timeouts = []
+
+        class FakeResp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            seen_timeouts.append(timeout)
+            return FakeResp()
+
+        with mock.patch.object(g.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok1 = g.publish_feed({"feed_url": "https://intent-guardian.megawebs.com/events", "feed_token_file": str(tok_file)}, state)
+            ok2 = g.publish_feed({"feed_url": "https://intent-guardian.megawebs.com/events", "feed_token_file": str(tok_file), "feed_timeout": 8.0}, state)
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)
+        self.assertEqual(seen_timeouts, [5.0, 8.0])
+
 
 if __name__ == "__main__":
     unittest.main()

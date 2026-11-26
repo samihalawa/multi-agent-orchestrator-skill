@@ -1264,7 +1264,20 @@ def validate_decision(decision, payload):
         raise ValueError("Intent compaction did not cite supplied human messages")
 
 
-def emit_correction(event, decision, host="codex"):
+def _dashboard_base_url(cfg):
+    url = str((cfg or {}).get("feed_url") or "").strip()
+    if not url.startswith("https://"):
+        return ""
+    if url.endswith("/events"):
+        url = url[:-len("/events")]
+    return url.rstrip("/") + "/"
+
+
+def _antigravity_user_markdown_step(system_text, user_markdown):
+    return {"systemMessage": {"systemMessage": system_text, "metadata": {"user_markdown": user_markdown}}}
+
+
+def emit_correction(event, decision, host="codex", dashboard_url=""):
     if host in WEB_HOSTS:
         correction = (
             GUARDIAN_TAG + " DO NOT STOP — COMPLETE THE FULL RESPONSE IN ONE PASS.\n"
@@ -1285,7 +1298,13 @@ def emit_correction(event, decision, host="codex"):
         if event == "Stop":
             return {"decision": "continue", "reason": correction}
         if event in {"PreInvocation", "PostInvocation", "SessionStart"}:
-            return {"injectSteps": [{"systemMessage": {"systemMessage": correction}}],
+            dash_suffix = f"\n\n[Dashboard]({dashboard_url})" if dashboard_url else ""
+            user_md = (
+                "🛡️ **Intent Guardian — Action Required**\n\n"
+                f"- **Gap:** {bounded(decision['reason'], 300)}\n"
+                f"- **Next:** {bounded(decision['next_action'], 400)}{dash_suffix}"
+            )
+            return {"injectSteps": [_antigravity_user_markdown_step(correction, user_md)],
                     "terminationBehavior": "force_continue" if event == "PostInvocation" else ""}
         return {}
     if event == "Stop" and host == "codex":
@@ -1865,7 +1884,7 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
                     )
                     can_emit = (not pending or pending_revision != current_revision or supersedes) and not stop_cap_hit
                     if can_emit and correction_hash != state.get("last_correction_hash"):
-                        output = emit_correction(name, decision, host)
+                        output = emit_correction(name, decision, host, dashboard_url=_dashboard_base_url(cfg))
                         feedback = (
                             output.get("reason")
                             or output.get("hookSpecificOutput", {}).get("additionalContext")
@@ -1934,13 +1953,34 @@ def process_event(event, host, cfg, state_dir, reviewer=call_model, force=False)
         if (
             not output
             and host == "antigravity"
+            and name == "PostInvocation"
+            and due
+            and why == "reviewed"
+            and not state.get("subagent")
+            and os.environ.get("INTENT_GUARDIAN_OBSERVER") != "1"
+        ):
+            dash_url = _dashboard_base_url(cfg)
+            dash_link = f" · [Dashboard]({dash_url})" if dash_url else ""
+            judge_model = (state.get("last_review") or {}).get("model") or cfg.get("model") or "judge"
+            checks = state.get("model_calls", 1)
+            if (state.get("last_review") or {}).get("decision", {}).get("resolved"):
+                badge = f"🛡️ **Intent Guardian** verified fix (review #{checks} · `{judge_model}`){dash_link}"
+            else:
+                badge = f"🛡️ **Intent Guardian** checked (review #{checks} · `{judge_model}`) — on track{dash_link}"
+            output = {"injectSteps": [_antigravity_user_markdown_step("", badge)]}
+        if (
+            not output
+            and host == "antigravity"
             and name == "SessionStart"
             and not state.get("subagent")
             and not state.get("first_step_reminded")
             and os.environ.get("INTENT_GUARDIAN_OBSERVER") != "1"
         ):
             state["first_step_reminded"] = True
-            output = {"injectSteps": [{"systemMessage": {"systemMessage": PRIOR_INSISTENCE_REMINDER}}]}
+            dash_url = _dashboard_base_url(cfg)
+            dash_link = f" · [Dashboard]({dash_url})" if dash_url else ""
+            user_md = f"🛡️ **Intent Guardian v{VERSION}** active — monitoring this session{dash_link}"
+            output = {"injectSteps": [_antigravity_user_markdown_step(PRIOR_INSISTENCE_REMINDER, user_md)]}
         state["status"] = why
         atomic_save(state_path, state)
         return output, state
@@ -2169,13 +2209,14 @@ def publish_feed(cfg, state):
     if not events:
         return False
     ok = True
+    timeout = max(1.0, min(15.0, float(cfg.get("feed_timeout", 5.0))))
     for i in range(0, len(events), 40):
         batch = events[i:i + 40]
         request = urllib.request.Request(url, data=json.dumps(batch).encode(),
                                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                                   "User-Agent": "IntentGuardian/" + VERSION})
         try:
-            with urllib.request.urlopen(request, timeout=1.2) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 if not (200 <= response.status < 300):
                     ok = False
         except (OSError, ValueError):
