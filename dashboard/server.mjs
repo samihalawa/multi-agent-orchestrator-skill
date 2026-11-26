@@ -1560,7 +1560,7 @@ html[data-theme="dark"]{
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html{font-family:var(--font);background:var(--bg);color:var(--text);font-size:15px;-webkit-font-smoothing:antialiased;container-type:scroll-state;scroll-padding-top:56px}
-body{min-height:100dvh;background:var(--bg)}
+body{min-height:100dvh;background:var(--bg);overflow-x:clip}
 button,input,select{font:inherit;color:inherit}
 button{background:none;border:0;cursor:pointer}
 a{color:inherit}
