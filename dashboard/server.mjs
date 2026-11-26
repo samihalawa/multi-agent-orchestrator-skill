@@ -1594,7 +1594,7 @@ a{color:inherit}
 .shell[data-wide="0"][data-view="list"] .main{display:none}
 .shell[data-wide="0"][data-view="detail"] .side,
 .shell[data-wide="0"][data-view="health"] .side{display:none}
-.shell[data-wide="0"][data-view="detail"] .top-bar{display:none}
+.app-frame:has(.shell[data-wide="0"][data-view="detail"]) .top-bar{display:none}
 
 @media (min-width:900px){
   html,body{height:100%;overflow:hidden}
