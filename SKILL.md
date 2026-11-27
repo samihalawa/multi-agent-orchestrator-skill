@@ -186,10 +186,12 @@ Remaining: <only real blockers or dependencies>
 ## Automatic intent oversight
 
 Continuous oversight belongs to the existing `fleet-babysitter` role, maintained
-in [references/fleet-babysitter.md](references/fleet-babysitter.md). Its semantic
-decision policy is [references/guardian-policy.md](references/guardian-policy.md).
-The executable adapter is [scripts/intent_guardian.py](scripts/intent_guardian.py).
-An agent role or an instruction paragraph alone does not activate it.
+in [references/fleet-babysitter.md](references/fleet-babysitter.md). The Intent
+Guardian engine, lifecycle hooks, watcher, MCP App, tests, and web dashboard now
+live in their own dedicated plugin package (`plugins/intent-guardian` in
+`2026-MASTER-Marketplace-Plugins-Connectors-etc`, installed as
+`intent-guardian@sami-master-plugins`). An agent role or an instruction paragraph
+alone does not activate it.
 
 Before installation, inspect the installed host's hook, scheduling, trust and
 reload contracts. Compare instruction-only, a task sidecar, native events and
